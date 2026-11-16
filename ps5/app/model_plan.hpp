@@ -68,6 +68,7 @@ struct Preset {
 
 const std::vector<Preset> & presets();
 const Preset * find_preset(const ModelInfo & m);
+std::string preset_label_for(const ModelInfo & m, const char * preset_cache_dir = nullptr);
 
 // llama-server's -ub for language models: how many prompt tokens go through
 // the GPU at once. 64 is what the console has run since the first release;
@@ -107,7 +108,7 @@ struct Plan {
 // kv_force: one cache type ("f16", "q8_0", "q4_0") instead of the best that fits.
 // ubatch: the prompt batch for a language model (its compute buffers grow with it).
 Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap = 65536, const char * kv_force = nullptr,
-                uint32_t ubatch = kPromptUbatch);
+                uint32_t ubatch = kPromptUbatch, const char * preset_cache_dir = nullptr);
 
 // Every .gguf in the given folders (not recursive), sorted by name. Split
 // files are listed by their first part only.

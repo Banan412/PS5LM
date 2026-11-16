@@ -1,11 +1,14 @@
 // Host check for model_plan.cpp:
-//   c++ -std=c++17 -O1 ps5/app/model_plan_test.cpp ps5/app/model_plan.cpp -o build/model_plan_test
+//   c++ -std=c++17 -O1 -I third_party/llama.cpp/vendor ps5/app/model_plan_test.cpp ps5/app/model_plan.cpp ps5/app/preset_fetch.cpp -o build/model_plan_test
 //   build/model_plan_test          synthetic headers only
 //   build/model_plan_test models   also the real GGUF files in models/
 // Uses the budget the console reported (11.38 GiB free) and the two
 // configurations measured there.
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "model_plan.hpp"
+#include "preset_fetch.hpp"
+
+#include <cmath>
 
 #include <algorithm>
 #include <cassert>
@@ -153,6 +156,107 @@ int main(int argc, char ** argv) {
         assert(std::find(gp.args.begin(), gp.args.end(), "--image-max-tokens") == gp.args.end());
         unlink((at + "/Qwen3.8-27B-UD-IQ2_S.gguf").c_str());
         unlink((at + "/mmproj-Qwen3.8-27B-F16.gguf").c_str());
+        rmdir(dir);
+    }
+
+    // Headroom-based RAM prompt cache (-cram) & checkpoints (-ctxcp):
+    // spare headroom enables RAM caching; tight headroom falls back to 0 / 1.
+    const ps5lm::Plan roomy = ps5lm::plan_model(c, budget, 65536);
+    assert(roomy.fits && !has_args(roomy, "-cram", "0") && !has_args(roomy, "-ctxcp", "1"));
+    const ps5lm::Plan tight = ps5lm::plan_model(c, c.file_bytes / (1024.0 * 1024.0 * 1024.0) + 1.1, 4096);
+    assert(tight.fits && has_args(tight, "-cram", "0") && has_args(tight, "-ctxcp", "1"));
+
+    // Built-in fine-tune presets for the user's installed Hugging Face models:
+    {
+        ps5lm::ModelInfo m2b = c;
+        m2b.file_name = "Qwen3.5-2B-Claude-4.6-OS-Auto-Variable-HERETIC-UNCENSORED-THINKING.Q8_0.gguf";
+        const ps5lm::Plan p2b = ps5lm::plan_model(m2b, budget);
+        assert(has_args(p2b, "--temp", "1.0") && has_args(p2b, "--presence-penalty", "1.5") &&
+               has_args(p2b, "--repeat-penalty", "1.0"));
+
+        ps5lm::ModelInfo m9b = c;
+        m9b.file_name = "Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-Q4_K_M.gguf";
+        const ps5lm::Plan p9b = ps5lm::plan_model(m9b, budget);
+        assert(has_args(p9b, "--temp", "1.0") && has_args(p9b, "--repeat-penalty", "1.0") &&
+               has_args(p9b, "--presence-penalty", "1.5"));
+
+        ps5lm::ModelInfo m12b = c;
+        m12b.file_name = "Qwen3.6-12B-IQ-Ultra-Heretic-Uncensored-Thinking-V2-Hightop-Q4_K_S.gguf";
+        const ps5lm::Plan p12b = ps5lm::plan_model(m12b, budget);
+        assert(has_args(p12b, "--temp", "1.0") && has_args(p12b, "--min-p", "0.05") &&
+               has_args(p12b, "--repeat-penalty", "1.05"));
+
+        ps5lm::ModelInfo m27b = c;
+        m27b.file_name = "Qwen3.8-27B-Ultimate-Heretic-Uncensored-Turbo-Brilliance-50x-AGI-NEO-Q4_K_M.gguf";
+        const ps5lm::Plan p27b = ps5lm::plan_model(m27b, budget);
+        assert(has_args(p27b, "--temp", "1.0") && has_args(p27b, "--top-k", "64") &&
+               has_args(p27b, "--min-p", "0.05") && has_args(p27b, "--repeat-penalty", "1.0"));
+    }
+
+    // Hugging Face README + generation_config.json parser and sidecar override:
+    {
+        assert(ps5lm::clean_gguf_search_stem("Qwen3.5-2B-Claude-4.6.Q8_0.gguf") == "Qwen3.5-2B-Claude-4.6");
+        assert(ps5lm::clean_gguf_search_stem("Model-00001-of-00004.gguf") == "Model");
+
+        const ps5lm::FetchedPreset p_hightop = ps5lm::parse_hf_model_metadata(
+            "DavidAU/Qwen3.6-12B-IQ-Ultra-Heretic-Uncensored-Thinking-V2-Hightop",
+            R"({"temperature": 1.0, "top_k": 20, "top_p": 0.95})",
+            "<B>SETTINGS:</B>\n- Temp 1, topp .95, minp .05, rep pen 1.05 [1 to 1.1 suggested]\n");
+        assert(p_hightop.found && p_hightop.has_temp && std::fabs(p_hightop.temp - 1.0) < 1e-4);
+        assert(p_hightop.has_top_k && p_hightop.top_k == 20);
+        assert(p_hightop.has_min_p && std::fabs(p_hightop.min_p - 0.05) < 1e-4);
+        assert(p_hightop.has_repeat_penalty && std::fabs(p_hightop.repeat_penalty - 1.05) < 1e-4);
+
+        const ps5lm::FetchedPreset p_27b = ps5lm::parse_hf_model_metadata(
+            "DavidAU/Qwen3.8-27B-Ultimate-Heretic-Uncensored-Turbo-Brilliance-50x-AGI-NEO-GGUF",
+            "{}",
+            "<b>Model Suggested Settings [from testing]:</b>\n"
+            "- Temp .5 to 1 \n"
+            "- Rep pen 1 [off]\n"
+            "- TopK 64, min p: 0.05, topp: 0.95 (tester settings)\n"
+            "The default reasoning mode is \"xhigh\". {REASON:deeptree} {REASON:einstein}\n",
+            "{%- set default_effort = 'xhigh' -%}");
+        assert(p_27b.found && std::fabs(p_27b.temp - 1.0) < 1e-4 && p_27b.top_k == 64);
+        assert(std::fabs(p_27b.min_p - 0.05) < 1e-4 && std::fabs(p_27b.repeat_penalty - 1.0) < 1e-4);
+        assert(p_27b.default_reasoning_effort == "xhigh");
+        assert(std::find(p_27b.thinking_modes.begin(), p_27b.thinking_modes.end(), "einstein") != p_27b.thinking_modes.end());
+
+        const auto q_9b = ps5lm::build_hf_search_queries(
+            "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-Q6_K.gguf");
+        assert(q_9b.size() >= 3);
+        assert(std::find(q_9b.begin(), q_9b.end(), "Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-MAX") !=
+               q_9b.end());
+        assert(std::find(q_9b.begin(), q_9b.end(), "Qwen3.5-9B-The-Defiant-Fable") != q_9b.end());
+
+        const auto q_27b = ps5lm::build_hf_search_queries(
+            "Qwen3.8-27B-Ultimate-Heretic-Uncn-Turbo-Brilli-50x-AGI-NEO-MTP-IQ2_M.gguf");
+        assert(std::find(q_27b.begin(), q_27b.end(),
+                         "Qwen3.8-27B-Ultimate-Heretic-Uncensored-Turbo-Brilliance-50x-AGI-NEO-MTP") !=
+               q_27b.end());
+        assert(std::find(q_27b.begin(), q_27b.end(), "Qwen3.8-27B-Ultimate-Heretic") != q_27b.end());
+
+        const ps5lm::FetchedPreset p_table = ps5lm::parse_hf_model_metadata(
+            "DavidAU/Qwen3.8-27B-Ultimate-Heretic-Uncensored-Turbo-Brilliance-50x-AGI-NEO-GGUF",
+            "{}",
+            "| **Reasoning Modes** | `deeptree`, `socrates`, `007`, `coder` |\n"
+            "| **X-Combined Modes** | `xeinstein`, `xspoon` |\n"
+            "- Temp .5 to 1 \n- Rep pen 1 [off]\n- TopK 64, min p: 0.05, topp: 0.95 (tester settings)\n");
+        assert(std::find(p_table.thinking_modes.begin(), p_table.thinking_modes.end(), "007") !=
+               p_table.thinking_modes.end());
+        assert(std::find(p_table.thinking_modes.begin(), p_table.thinking_modes.end(), "xeinstein") !=
+               p_table.thinking_modes.end());
+        assert(p_table.sync_version == ps5lm::kPresetSyncVersion);
+
+        char dir[] = "/tmp/preset_sidecar_test.XXXXXX";
+        assert(mkdtemp(dir));
+        const std::string model_p = std::string(dir) + "/CustomModel-Q4_K_M.gguf";
+        assert(ps5lm::save_preset_sidecar(model_p, p_hightop));
+        ps5lm::ModelInfo custom = c;
+        custom.path             = model_p;
+        custom.file_name        = "CustomModel-Q4_K_M.gguf";
+        const ps5lm::Plan custom_plan = ps5lm::plan_model(custom, budget);
+        assert(has_args(custom_plan, "--repeat-penalty", "1.05") && has_args(custom_plan, "--min-p", "0.05"));
+        unlink((model_p + ".preset.json").c_str());
         rmdir(dir);
     }
 

@@ -54,6 +54,7 @@
 #include "display.hpp"
 #include "ggml-backend.h"
 #include "model_plan.hpp"
+#include "preset_sync.hpp"
 #include "probes.hpp"
 #include "report.hpp"
 #include "settings.hpp"
@@ -685,6 +686,7 @@ struct Models {
                 dirs.push_back(d);
             }
         }
+        const std::string preset_cache = data_path("presets");
         for (const auto & path : find_models(dirs)) {
             const ModelInfo m = read_model_info(path);
             ModelRow row;
@@ -696,13 +698,12 @@ struct Models {
                 rows.push_back(row);
                 continue;
             }
-            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv);
-            const Preset * pre = find_preset(m);
+            const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv, kPromptUbatch, preset_cache.c_str());
             row.arch = m.arch;
             row.plan = p.why;
             row.fits = p.fits;
             row.size_gib = m.file_bytes / 1073741824.0;
-            row.preset = pre ? pre->label : "";
+            row.preset = preset_label_for(m, preset_cache.c_str());
             row.decision = m.decision;
             row.current = path == running;
             rows.push_back(row);
@@ -721,15 +722,15 @@ struct Models {
 
     // The arguments for a model: the planner's, or app-args.txt's verbatim.
     std::vector<std::string> args_for(const std::string & path, Live & model_part) {
+        const std::string preset_cache = data_path("presets");
         const ModelInfo m = read_model_info(path);
-        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force());
-        const Preset * pre = find_preset(m);
+        const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force(), kPromptUbatch, preset_cache.c_str());
         model_part.model_label = base_name(path);
         model_part.model_file  = path;
         model_part.plan        = p.why;
         model_part.args        = p.args;
         model_part.model_arch  = m.arch;
-        model_part.preset      = pre ? pre->label : "";
+        model_part.preset      = preset_label_for(m, preset_cache.c_str());
         model_part.decision    = m.decision;
         model_part.model_gib   = m.file_bytes / 1073741824.0;
         model_part.ctx         = p.ctx;
@@ -1125,6 +1126,23 @@ int main(int, char **) {
     }
     pthread_join(booting, nullptr);
 
+    // Sync Hugging Face author-recommended presets in the background for all
+    // installed models lacking a cached .preset.json sidecar.
+    std::atomic<bool> presets_updated{ false };
+    {
+        std::vector<std::string> paths;
+        paths.reserve(models.rows.size());
+        for (const auto & r : models.rows) {
+            paths.push_back(r.file);
+        }
+        if (!paths.empty()) {
+            const std::string cache_dir = data_path("presets");
+            std::thread([paths = std::move(paths), cache_dir, &presets_updated] {
+                sync_presets_for_models(paths, cache_dir, [&presets_updated] { presets_updated = true; });
+            }).detach();
+        }
+    }
+
     // Input and sound, as ps5-homebrew-ui's own app does.
     hui::ps5::Pad pad;
     pad.open();
@@ -1268,6 +1286,9 @@ int main(int, char **) {
         }
 
         // A settings rescan in the background: say so until it lands.
+        if (presets_updated.exchange(false)) {
+            models.rescan(stats, false);
+        }
         if (models.poll_rescan(stats) && models.scan_shown) {
             char text[96];
             std::snprintf(text, sizeof(text), "Planning every model again for %uk tokens and the %s cache",

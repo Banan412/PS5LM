@@ -5,6 +5,7 @@
 #include "fetch.hpp"
 #include "ftp_writer.hpp"
 #include "model_plan.hpp"
+#include "preset_sync.hpp"
 #include "storage.hpp"
 
 #include <nlohmann/json.hpp>
@@ -725,6 +726,11 @@ bool Market::fetch(Download & d) {
         d.state = DownloadState::failed;
         d.note = "Failed: could not rename the file";
     } else {
+        if (to.find("mmproj") == std::string::npos) {
+            d.note = "Fetching model preset from Hugging Face";
+            publish(true);
+            sync_preset_for_repo(d.repo, to, data_path("presets"));
+        }
         d.state = DownloadState::done;
         d.note = "Saved to " + to;
     }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "model_plan.hpp"
+#include "preset_fetch.hpp"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -314,6 +315,21 @@ const std::vector<Preset> & presets() {
         // PrismML's model card (thinking mode); min_p 0.05 is not in the file.
         { "bonsai", "Bonsai 2", "Qwen 3.8 27B in ternary weights; Q2_0 is 7.1 GiB and keeps 64k with room to spare",
           { "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.05" }, 65536 },
+        // Author-recommended fine-tune presets (matched before generic family entries).
+        { "defiant-fable", "Defiant Fable 9B", "Qwen 3.5 9B NEO MTP; keep rep pen 1.0, supports xhigh and {REASON:...}",
+          { "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0", "--presence-penalty", "1.5", "--repeat-penalty", "1.0" } },
+        { "claude-4.6", "Claude-4.6 Thinking", "Qwen 3.5 2B Thinking; presence_penalty 1.5 prevents thinking loops",
+          { "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0", "--presence-penalty", "1.5", "--repeat-penalty", "1.0" } },
+        { "auto-variable", "Auto-Variable Thinking", "Qwen 3.5 Auto-Variable; presence_penalty 1.5 prevents thinking loops",
+          { "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0", "--presence-penalty", "1.5", "--repeat-penalty", "1.0" } },
+        { "iq-ultra", "IQ-Ultra Hightop 12B", "Qwen 3.6 12B Hightop V2; temp 1.0, min_p 0.05, rep pen 1.05",
+          { "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.05", "--repeat-penalty", "1.05" } },
+        { "hightop", "Hightop V2 12B", "Qwen 3.6 12B Hightop V2; temp 1.0, min_p 0.05, rep pen 1.05",
+          { "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.05", "--repeat-penalty", "1.05" } },
+        { "turbo-brilliance", "Turbo Brilliance 50x", "Qwen 3.8 27B; top_k 64, min_p 0.05, rep pen 1.0, supports xhigh and {REASON:...}",
+          { "--temp", "1.0", "--top-p", "0.95", "--top-k", "64", "--min-p", "0.05", "--repeat-penalty", "1.0" } },
+        { "ultimate-heretic", "Ultimate Heretic 27B", "Qwen 3.8 27B; top_k 64, min_p 0.05, rep pen 1.0, supports xhigh and {REASON:...}",
+          { "--temp", "1.0", "--top-p", "0.95", "--top-k", "64", "--min-p", "0.05", "--repeat-penalty", "1.0" } },
         { "qwen3.8", "Qwen 3.8", "27B hybrid Gated DeltaNet; UD-Q2_K_XL holds 64k context on the GPU",
           { "--temp", "0.6", "--top-p", "0.95", "--top-k", "20", "--min-p", "0" } },
         { "qwen3.6", "Qwen 3.6", "MoE 35B-A3B or dense 27B; the MoE decodes fastest",
@@ -351,10 +367,30 @@ const Preset * find_preset(const ModelInfo & m) {
     return nullptr;
 }
 
-Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force, uint32_t ubatch) {
-    Plan p;
+std::string preset_label_for(const ModelInfo & m, const char * preset_cache_dir) {
+    if (!m.decision.empty()) {
+        return {};
+    }
+    FetchedPreset sidecar;
+    if (!m.path.empty() && load_preset_sidecar(m.path, &sidecar, preset_cache_dir ? preset_cache_dir : "") &&
+        sidecar.found && !sidecar.label.empty()) {
+        return sidecar.label;
+    }
     const Preset * preset = find_preset(m);
-    if (preset && preset->max_ctx) {
+    return preset ? preset->label : "";
+}
+
+Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force, uint32_t ubatch,
+                const char * preset_cache_dir) {
+    Plan p;
+    FetchedPreset sidecar;
+    const bool    has_sidecar = m.decision.empty() && !m.path.empty() &&
+                             load_preset_sidecar(m.path, &sidecar, preset_cache_dir ? preset_cache_dir : "") &&
+                             sidecar.found && sidecar.has_sampling();
+    const Preset * preset = find_preset(m);
+    if (has_sidecar && sidecar.max_ctx) {
+        ctx_cap = std::min(ctx_cap, sidecar.max_ctx);
+    } else if (preset && preset->max_ctx) {
         ctx_cap = std::min(ctx_cap, preset->max_ctx);
     }
     // Decision prompts are short; 4k keeps the cache small for the wide batch below.
@@ -437,13 +473,22 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
                   p.kv_type.c_str(), m.mmproj.empty() ? "" : ", images", p.total_gib, budget_gib);
     p.why = why;
 
+    // Give llama-server a bounded RAM prompt cache when spare headroom exists
+    // so switching chats/agents does not force a full re-prefill, while
+    // keeping a 0.5 GiB safety margin below budget_gib.
+    const double headroom_gib = std::max(0.0, budget_gib - p.total_gib);
+    uint32_t cram_mib = 0;
+    uint32_t ctxcp    = 1;
+    if (headroom_gib >= 0.75) {
+        cram_mib = std::min<uint32_t>(2048, std::max<uint32_t>(256, (uint32_t) ((headroom_gib - 0.5) * 512.0)));
+        ctxcp    = cram_mib >= 1024 ? 8 : 4;
+    }
+
     p.args = { "-m", m.path, "-ngl", "999", "-fit", "off", "-lm", "none",
                "-c", std::to_string(p.ctx), "-fa", "on", "-ctk", p.kv_type, "-ctv", p.kv_type,
                "-b", std::to_string(causal_vision ? kVisionImageCap : std::max<uint32_t>(256, p.ubatch)),
                "-ub", std::to_string(p.ubatch), "-np", "1",
-               // One prompt checkpoint and no RAM cache: llama-server's defaults
-               // (32 checkpoints, 8 GiB) are for a PC, and the CPU shares this pool.
-               "-ctxcp", "1", "-cram", "0",
+               "-ctxcp", std::to_string(ctxcp), "-cram", std::to_string(cram_mib),
                "--host", "0.0.0.0", "--port", "8081" };
     if (!m.mmproj.empty()) {
         p.args.insert(p.args.end(), { "--mmproj", m.mmproj });
@@ -451,7 +496,10 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     if (causal_vision) {
         p.args.insert(p.args.end(), { "--image-max-tokens", std::to_string(kVisionImageCap) });
     }
-    if (preset) {
+    if (has_sidecar) {
+        const std::vector<std::string> sargs = preset_to_llama_args(sidecar);
+        p.args.insert(p.args.end(), sargs.begin(), sargs.end());
+    } else if (preset) {
         p.args.insert(p.args.end(), preset->args.begin(), preset->args.end());
     }
     return p;
