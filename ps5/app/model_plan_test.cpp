@@ -160,11 +160,39 @@ int main(int argc, char ** argv) {
     }
 
     // Headroom-based RAM prompt cache (-cram) & checkpoints (-ctxcp):
-    // spare headroom enables RAM caching; tight headroom falls back to 0 / 1.
+    // spare headroom enables RAM caching; tight headroom switches automatically to disk caching (--cache-disk).
     const ps5lm::Plan roomy = ps5lm::plan_model(c, budget, 65536);
     assert(roomy.fits && !has_args(roomy, "-cram", "0") && !has_args(roomy, "-ctxcp", "1"));
+    assert(has_args(roomy, "--cache-disk", "/data/PS5LM/cache/prompts"));
     const ps5lm::Plan tight = ps5lm::plan_model(c, c.file_bytes / (1024.0 * 1024.0 * 1024.0) + 1.1, 4096);
     assert(tight.fits && has_args(tight, "-cram", "0") && has_args(tight, "-ctxcp", "1"));
+    assert(has_args(tight, "--cache-disk", "/data/PS5LM/cache/prompts") && has_args(tight, "--cache-disk-mib", "4096"));
+
+    // Disk cache off leaves out --cache-disk and preserves strict fixed kv_type without expansion.
+    const ps5lm::Plan no_disk = ps5lm::plan_model(c, budget, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "off");
+    assert(no_disk.fits && std::find(no_disk.args.begin(), no_disk.args.end(), "--cache-disk") == no_disk.args.end());
+
+    // Near-full VRAM with fixed q8_0 expands to a longer context via q4_0 automatically when disk overflow is "auto".
+    const double tight_budget = 6.55;
+    const ps5lm::Plan strict_q8 = ps5lm::plan_model(c, tight_budget, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "off");
+    const ps5lm::Plan auto_exp  = ps5lm::plan_model(c, tight_budget, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "auto", 4096);
+    assert(auto_exp.fits && (!strict_q8.fits || auto_exp.ctx > strict_q8.ctx) && auto_exp.kv_type == "q4_0");
+    assert(has_args(auto_exp, "-cram", "0") && has_args(auto_exp, "--cache-disk", "/data/PS5LM/cache/prompts"));
+
+    // 18B MoE (~10.59 GiB) on 11.56 GiB free pool must fit with >= 8k context when disk overflow is "auto"/"on".
+    ps5lm::ModelInfo moe18 = c;
+    moe18.arch       = "qwen35moe";
+    moe18.file_name  = "qwen3.5-18b-a3b-reap-coding-heretic-v0.i1-Q4_K_M.gguf";
+    moe18.file_bytes = 11375418272ull;
+    moe18.n_expert   = 256;
+    moe18.full_attn_every = 4;
+    moe18.state_bytes = 64ull << 20;
+    const ps5lm::Plan p18_auto = ps5lm::plan_model(moe18, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "auto", 4096);
+    const ps5lm::Plan p18_on   = ps5lm::plan_model(moe18, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "on", 4096);
+    assert(p18_auto.fits && p18_auto.ctx >= 8192 && has_args(p18_auto, "-cram", "0") &&
+           has_args(p18_auto, "--cache-disk", "/data/PS5LM/cache/prompts"));
+    assert(p18_on.fits && p18_on.ctx >= 8192 && has_args(p18_on, "-cram", "0") &&
+           has_args(p18_on, "--cache-disk", "/data/PS5LM/cache/prompts"));
 
     // Built-in fine-tune presets for the user's installed Hugging Face models:
     {

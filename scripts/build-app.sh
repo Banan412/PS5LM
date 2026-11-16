@@ -68,6 +68,9 @@ fi
 # then patches/fleet for the RPC worker (docs/FLEET.md), the same set the fleet
 # host build applies.
 for p in "$root"/patches/*.patch "$root"/patches/fleet/*.patch; do
+    if [ "$(basename "$p")" = "0011-kv-rotation-on-device.patch" ] && grep -q init_attn_rot_dev "$llama/src/llama-kv-cache.cpp"; then
+        continue
+    fi
     git -C "$llama" apply --reverse --check "$p" 2>/dev/null || git -C "$llama" apply "$p"
 done
 

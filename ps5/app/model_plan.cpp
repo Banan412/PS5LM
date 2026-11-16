@@ -381,7 +381,8 @@ std::string preset_label_for(const ModelInfo & m, const char * preset_cache_dir)
 }
 
 Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force, uint32_t ubatch,
-                const char * preset_cache_dir) {
+                const char * preset_cache_dir, const char * disk_cache_mode, uint32_t disk_cache_mib,
+                const char * disk_cache_dir) {
     Plan p;
     FetchedPreset sidecar;
     const bool    has_sidecar = m.decision.empty() && !m.path.empty() &&
@@ -402,86 +403,126 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     }
     p.weights_gib = (m.file_bytes + m.mmproj_bytes) / kGiB;
     p.state_gib   = m.state_bytes / kGiB;
-    // Compute buffers and the CPU side (the title heap shares the pool), plus
-    // one prompt checkpoint of the recurrent state. Calibrated on the console:
-    // Qwen3.8-27B UD-Q2_K_XL at 64k with a q4_0 cache ran with 11.38 GiB free.
-    // ponytail: 0.25 GiB for the image encoder's buffers is a guess; measure on the console.
-    // Decision models (laya, clef, vllm-d3, lfm2-d1-omni) and non-causal image
-    // encoders (mtmd caps an image to the ubatch) need a whole prompt or image in
-    // one ubatch, so they get 2048, the size #13 ran on the console.
-    // A causal projector (Qwen's) takes the image in pieces: its model gets
-    // kVisionUbatch and is not wide.
     const bool causal_vision = !m.mmproj.empty() && m.decision.empty() && causal_projector(m.projector_type);
     const bool wide = !m.decision.empty() || (!m.mmproj.empty() && !causal_vision);
     p.ubatch = wide ? 2048 : causal_vision ? kVisionUbatch : std::max<uint32_t>(ubatch, 1);
-    // Compute buffers grow with the ubatch, by about 38 bytes a token for each
-    // unit of feed-forward width: on Qwen 3.8 27B (17,408 wide), at 64k with a
-    // q4_0 cache, ggml-vulkan's device and host compute buffers took 41 MiB
-    // at -ub 64 and 321 MiB at 512, measured on a PC with the console's shader
-    // paths. The 0.75 GiB above holds the 64 the console was calibrated at.
     const double ub_extra = !wide && p.ubatch > 64 ? (p.ubatch - 64) * (double) m.n_ff * 38.0 / kGiB : 0.0;
-    // shortcut: 0.5 GiB more compute buffer for the 2048 ubatch is a guess; measure on the console.
-    // A causal vision model keeps the 0.5 as headroom: each photo needs working
-    // memory, and free memory shrank by about 0.5 GiB over 100 photos on the
-    // console (Qwen 3.8 27B, -ub 256).
-    p.reserve_gib = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide || causal_vision ? 0.5 : 0.0) + ub_extra;
+    const double base_reserve = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide || causal_vision ? 0.5 : 0.0) + ub_extra;
+    p.reserve_gib = base_reserve;
 
     // The longest context first, and at each length the best cache that fits.
     static const uint32_t ctxs[]  = { 262144, 196608, 131072, 65536, 32768, 16384, 8192, 4096 };
     static const char *   types[] = { "f16", "q8_0", "q4_0" };
-    for (uint32_t ctx : ctxs) {
-        if (ctx > ctx_cap) {
-            continue;
-        }
-        for (const char * t : types) {
-            if (kv_force && std::strcmp(t, kv_force) != 0) {
+    const auto try_fit = [&](const char * only_type, uint32_t plan_ubatch, double reserve, Plan & out) {
+        for (uint32_t ctx : ctxs) {
+            if (ctx > ctx_cap) {
                 continue;
             }
-            // f16 only where it is cheap: q8_0 costs nothing measurable in quality.
-            if (!kv_force && std::strcmp(t, "f16") == 0 && ctx > 8192) {
-                continue;
-            }
-            // Window layers hold the window and one ubatch, padded to 256,
-            // whatever the context (llama.cpp's iSWA cache without --swa-full).
-            const uint32_t swa_tokens = std::min(ctx, (m.swa_window + p.ubatch + 255) / 256 * 256);
-            const double   kv         = (kv_bytes_per_token(m, t) * ctx +
-                                 m.n_swa_layers * kv_bytes_per_layer_token(m, t) * swa_tokens) / kGiB;
-            const double total = p.weights_gib + kv + p.state_gib + p.reserve_gib;
-            if (total <= budget_gib) {
-                p.fits = true;
-                p.ctx = ctx;
-                p.kv_type = t;
-                p.kv_gib = kv;
-                p.total_gib = total;
-                break;
+            for (const char * t : types) {
+                if (only_type && std::strcmp(t, only_type) != 0) {
+                    continue;
+                }
+                // f16 only where it is cheap: q8_0 costs nothing measurable in quality.
+                if (!only_type && std::strcmp(t, "f16") == 0 && ctx > 8192) {
+                    continue;
+                }
+                const uint32_t swa_tokens = std::min(ctx, (m.swa_window + plan_ubatch + 255) / 256 * 256);
+                const double   kv         = (kv_bytes_per_token(m, t) * ctx +
+                                     m.n_swa_layers * kv_bytes_per_layer_token(m, t) * swa_tokens) / kGiB;
+                const double total = p.weights_gib + kv + p.state_gib + reserve;
+                if (total <= budget_gib) {
+                    out.fits = true;
+                    out.ctx = ctx;
+                    out.ubatch = plan_ubatch;
+                    out.reserve_gib = reserve;
+                    out.kv_type = t;
+                    out.kv_gib = kv;
+                    out.total_gib = total;
+                    return;
+                }
             }
         }
-        if (p.fits) {
-            break;
+    };
+
+    try_fit(kv_force, p.ubatch, base_reserve, p);
+
+    const std::string dmode = disk_cache_mode ? lower(disk_cache_mode) : "auto";
+    const bool allow_overflow_fit = m.decision.empty() && (dmode == "auto" || dmode == "on");
+    bool overflow_kv_step = false;
+    bool compact_compute  = false;
+    if (allow_overflow_fit && kv_force && std::strcmp(kv_force, "q4_0") != 0 && (!p.fits || p.ctx < ctx_cap)) {
+        Plan q4_plan = p;
+        q4_plan.fits = false;
+        q4_plan.ctx = 0;
+        try_fit("q4_0", p.ubatch, base_reserve, q4_plan);
+        if (q4_plan.fits && (!p.fits || q4_plan.ctx > p.ctx)) {
+            p = q4_plan;
+            overflow_kv_step = true;
         }
     }
 
-    char why[160];
+    // When VRAM is still near full (!fits or ctx < ctx_cap or headroom < 0.35 GiB) and disk overflow is
+    // enabled ("auto" / "on"), drop compute ubatch 64->32 & disable RAM prompt checkpoints (-ctxcp 0)
+    // to reclaim ~0.17 GiB for larger models and longer contexts without crashing.
+    if (allow_overflow_fit && !wide && !causal_vision && ubatch == kPromptUbatch
+        && (!p.fits || (p.ctx < ctx_cap && (budget_gib - p.total_gib) < 0.5))) {
+        const uint32_t tight_ubatch  = 32;
+        const double   tight_reserve = std::max(0.50, base_reserve - 0.17);
+        Plan tight_plan = p;
+        tight_plan.fits = false;
+        tight_plan.ctx  = 0;
+        const char * try_type = (kv_force && dmode != "on" && p.fits && p.kv_type != "q4_0") ? kv_force : nullptr;
+        try_fit(try_type, tight_ubatch, tight_reserve, tight_plan);
+        if ((!tight_plan.fits || tight_plan.ctx < ctx_cap) && try_type && std::strcmp(try_type, "q4_0") != 0) {
+            Plan tight_q4 = tight_plan;
+            tight_q4.fits = false;
+            tight_q4.ctx  = 0;
+            try_fit("q4_0", tight_ubatch, tight_reserve, tight_q4);
+            if (tight_q4.fits && (!tight_plan.fits || tight_q4.ctx > tight_plan.ctx)) {
+                tight_plan = tight_q4;
+                overflow_kv_step = true;
+            }
+        }
+        if (tight_plan.fits && (!p.fits || tight_plan.ctx > p.ctx)) {
+            if (tight_plan.kv_type == "q4_0" && kv_force && std::strcmp(kv_force, "q4_0") != 0) {
+                overflow_kv_step = true;
+            }
+            p = tight_plan;
+            compact_compute = true;
+        }
+    }
+
+    char why[192];
     if (!p.fits) {
         p.total_gib = p.weights_gib + p.state_gib + p.reserve_gib;
         std::snprintf(why, sizeof(why), "needs %.1f GiB with a 4k context; %.1f GiB is free", p.total_gib, budget_gib);
         p.why = why;
         return p;
     }
-    std::snprintf(why, sizeof(why), "%s%uk context, %s cache%s: %.1f of %.1f GiB",
+
+    const double headroom_gib = std::max(0.0, budget_gib - p.total_gib);
+    const bool near_full_vram = headroom_gib < 0.75 || compact_compute;
+    const bool disk_supported = m.decision.empty() && disk_cache_dir && *disk_cache_dir && disk_cache_mib > 0;
+    const bool disk_active = disk_supported && (dmode == "on" || dmode == "auto");
+    const bool disk_primary = disk_active && (near_full_vram || dmode == "on");
+
+    std::snprintf(why, sizeof(why), "%s%uk context, %s cache%s%s: %.1f of %.1f GiB",
                   m.decision.empty() ? "" : ("decision model (" + m.decision + "), ").c_str(), p.ctx / 1024,
-                  p.kv_type.c_str(), m.mmproj.empty() ? "" : ", images", p.total_gib, budget_gib);
+                  p.kv_type.c_str(), m.mmproj.empty() ? "" : ", images",
+                  (overflow_kv_step || compact_compute) ? " (expanded)" : (disk_primary ? " + disk" : ""),
+                  p.total_gib, budget_gib);
     p.why = why;
 
-    // Give llama-server a bounded RAM prompt cache when spare headroom exists
-    // so switching chats/agents does not force a full re-prefill, while
-    // keeping a 0.5 GiB safety margin below budget_gib.
-    const double headroom_gib = std::max(0.0, budget_gib - p.total_gib);
+    // Keep at least a 0.5 GiB margin when allocating RAM prompt cache; when VRAM is
+    // full/near-full (< 0.75 GiB headroom), run prompt checkpoints purely on disk.
     uint32_t cram_mib = 0;
-    uint32_t ctxcp    = 1;
-    if (headroom_gib >= 0.75) {
+    uint32_t ctxcp    = compact_compute ? 0 : 1;
+    if (dmode != "on" && !near_full_vram && headroom_gib >= 0.75) {
         cram_mib = std::min<uint32_t>(2048, std::max<uint32_t>(256, (uint32_t) ((headroom_gib - 0.5) * 512.0)));
-        ctxcp    = cram_mib >= 1024 ? 8 : 4;
+        ctxcp = cram_mib >= 1024 ? 8 : 4;
+    } else if (dmode == "on" && headroom_gib >= 1.5 && !compact_compute) {
+        cram_mib = 256;
+        ctxcp = 4;
     }
 
     p.args = { "-m", m.path, "-ngl", "999", "-fit", "off", "-lm", "none",
@@ -490,6 +531,9 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
                "-ub", std::to_string(p.ubatch), "-np", "1",
                "-ctxcp", std::to_string(ctxcp), "-cram", std::to_string(cram_mib),
                "--host", "0.0.0.0", "--port", "8081" };
+    if (disk_active) {
+        p.args.insert(p.args.end(), { "--cache-disk", disk_cache_dir, "--cache-disk-mib", std::to_string(disk_cache_mib) });
+    }
     if (!m.mmproj.empty()) {
         p.args.insert(p.args.end(), { "--mmproj", m.mmproj });
     }
