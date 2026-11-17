@@ -407,6 +407,13 @@ int main(int argc, char ** argv) {
            has_args(fb, "--cache-disk-mib", "2048"));
     const ps5lm::Plan zero_mib = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "on", 0);
     assert(zero_mib.fits && std::find(zero_mib.args.begin(), zero_mib.args.end(), "--cache-disk") == zero_mib.args.end());
+    // Large disk cache limits dynamically lift default <=64k ceilings when RAM allows (disabled when disk_cache == "off").
+    const ps5lm::Plan big_disk = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "auto", 32768);
+    assert(big_disk.fits && big_disk.ctx == 131072);
+    const ps5lm::Plan big_disk_off = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "off", 32768);
+    assert(big_disk_off.fits && big_disk_off.ctx == 65536);
+    const ps5lm::Plan med_disk = ps5lm::plan_model(c, budget, 32768, "auto", ps5lm::kPromptUbatch, nullptr, "auto", 16384);
+    assert(med_disk.fits && med_disk.ctx == 65536);
 
     if (argc < 2) {
         std::puts("model_plan_test: ok (synthetic only)");

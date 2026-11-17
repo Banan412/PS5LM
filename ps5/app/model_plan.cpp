@@ -386,6 +386,19 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     if (kv_force && (*kv_force == '\0' || std::strcmp(kv_force, "auto") == 0)) {
         kv_force = nullptr;
     }
+    std::string dmode = disk_cache_mode ? lower(disk_cache_mode) : "auto";
+    if (dmode != "auto" && dmode != "on" && dmode != "off") {
+        dmode = "auto";
+    }
+    // Larger SSD checkpoint limits dynamically lift default context ceilings when RAM permits:
+    // 16 GB+ lifts a 32k cap to 64k, and 32 GB lifts <=64k default caps to 128k (capped by model/preset max_ctx).
+    if (m.decision.empty() && dmode != "off") {
+        if (disk_cache_mib >= 32768 && ctx_cap <= 65536) {
+            ctx_cap = 131072;
+        } else if (disk_cache_mib >= 16384 && ctx_cap == 32768) {
+            ctx_cap = 65536;
+        }
+    }
     Plan p;
     FetchedPreset sidecar;
     const bool    has_sidecar = m.decision.empty() && !m.path.empty() &&
@@ -452,10 +465,6 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
 
     try_fit(kv_force, p.ubatch, base_reserve, budget_gib, p);
 
-    std::string dmode = disk_cache_mode ? lower(disk_cache_mode) : "auto";
-    if (dmode != "auto" && dmode != "on" && dmode != "off") {
-        dmode = "auto";
-    }
     const bool allow_kv_step = m.decision.empty() && (dmode == "auto" || dmode == "on");
     const uint32_t min_honored_ctx = std::min<uint32_t>(ctx_cap, 8192);
     const bool step_for_longer = (dmode == "on");
