@@ -390,15 +390,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     if (dmode != "auto" && dmode != "on" && dmode != "off") {
         dmode = "auto";
     }
-    // Larger SSD checkpoint limits dynamically lift default context ceilings when RAM permits:
-    // 16 GB+ lifts a 32k cap to 64k, and 32 GB lifts <=64k default caps to 128k (capped by model/preset max_ctx).
-    if (m.decision.empty() && dmode != "off") {
-        if (disk_cache_mib >= 32768 && ctx_cap <= 65536) {
-            ctx_cap = 131072;
-        } else if (disk_cache_mib >= 16384 && ctx_cap == 32768) {
-            ctx_cap = 65536;
-        }
-    }
+    // Honor the caller's ctx_cap ("Longest context") strictly; never exceed it automatically.
     Plan p;
     FetchedPreset sidecar;
     const bool    has_sidecar = m.decision.empty() && !m.path.empty() &&
@@ -488,7 +480,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     // margin. These compute/checkpoint savings also run when disk_cache == "off" (without
     // relaxing an explicit kv_force).
     if (m.decision.empty() && !wide && !causal_vision && ubatch == kPromptUbatch
-        && (!p.fits || (p.ctx < ctx_cap && (budget_gib - p.total_gib) < 0.5))) {
+        && (!p.fits || p.ctx < ctx_cap)) {
         const uint32_t tight_ubatch     = 32;
         const double   tight_reserve    = std::max(0.50, base_reserve - 0.17);
         const double   effective_budget = std::max(0.0, budget_gib - 0.15);

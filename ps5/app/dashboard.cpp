@@ -103,7 +103,7 @@ constexpr SettingCategory kCategories[] = {
       { { Setting::ctx_cap, "Longest context", "The longest that fits, up to this; applies at the next load" },
         { Setting::kv_type, "Context cache", "Auto picks the best that fits; a fixed type trades length for quality" },
         { Setting::disk_cache, "Disk cache spillover", "Auto moves prompt cache to SSD & expands context when VRAM is near full" },
-        { Setting::disk_cache_mib, "Disk cache limit", "SSD checkpoint budget (32 GB also unlocks 128k context when RAM fits)" } },
+        { Setting::disk_cache_mib, "Disk cache limit", "How much SSD space to reserve for saved prompt checkpoints" } },
       4 },
     { "Chat",
       { { Setting::tools, "File tools", "The browser chat may read and write files in /data/PS5LM/scratch" },

@@ -407,13 +407,19 @@ int main(int argc, char ** argv) {
            has_args(fb, "--cache-disk-mib", "2048"));
     const ps5lm::Plan zero_mib = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "on", 0);
     assert(zero_mib.fits && std::find(zero_mib.args.begin(), zero_mib.args.end(), "--cache-disk") == zero_mib.args.end());
-    // Large disk cache limits dynamically lift default <=64k ceilings when RAM allows (disabled when disk_cache == "off").
+    // Large or small disk cache limits strictly honor Longest context (ctx_cap) and keep spillover enabled across 2..32 GB.
     const ps5lm::Plan big_disk = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "auto", 32768);
-    assert(big_disk.fits && big_disk.ctx == 131072);
-    const ps5lm::Plan big_disk_off = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "off", 32768);
-    assert(big_disk_off.fits && big_disk_off.ctx == 65536);
-    const ps5lm::Plan med_disk = ps5lm::plan_model(c, budget, 32768, "auto", ps5lm::kPromptUbatch, nullptr, "auto", 16384);
-    assert(med_disk.fits && med_disk.ctx == 65536);
+    assert(big_disk.fits && big_disk.ctx == 65536 && has_args(big_disk, "--cache-disk-mib", "32768"));
+    const ps5lm::Plan cap_128k = ps5lm::plan_model(c, budget, 131072, "auto", ps5lm::kPromptUbatch, nullptr, "auto", 4096);
+    assert(cap_128k.fits && cap_128k.ctx == 131072 && has_args(cap_128k, "--cache-disk-mib", "4096"));
+    // When p.ctx < ctx_cap even with >0.5 GiB initial headroom, tight compute compaction unlocks longer context.
+    ps5lm::ModelInfo iq2_27b;
+    iq2_27b.ok = true; iq2_27b.file_bytes = 10243816864ull; iq2_27b.n_layer = 64; iq2_27b.full_attn_every = 4;
+    iq2_27b.n_head_kv = 4; iq2_27b.key_length = iq2_27b.value_length = 256; iq2_27b.state_bytes = 160ull << 20;
+    const ps5lm::Plan p27_q8 = ps5lm::plan_model(iq2_27b, 11.74, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "auto", 2048, "/data/PS5LM/cache/prompts", true);
+    assert(p27_q8.fits && p27_q8.ctx == 32768 && p27_q8.kv_type == "q8_0" && p27_q8.disable_introspect);
+    const ps5lm::Plan p27_auto = ps5lm::plan_model(iq2_27b, 11.74, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "auto", 2048, "/data/PS5LM/cache/prompts", true);
+    assert(p27_auto.fits && p27_auto.ctx == 32768 && p27_auto.kv_type == "q4_0");
 
     if (argc < 2) {
         std::puts("model_plan_test: ok (synthetic only)");
