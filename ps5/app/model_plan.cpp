@@ -407,8 +407,9 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     const bool wide = !m.decision.empty() || (!m.mmproj.empty() && !causal_vision);
     p.ubatch = wide ? 2048 : causal_vision ? kVisionUbatch : std::max<uint32_t>(ubatch, 1);
     const double ub_extra = !wide && p.ubatch > 64 ? (p.ubatch - 64) * (double) m.n_ff * 38.0 / kGiB : 0.0;
-    const double base_reserve = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25)
-                              + (wide || causal_vision ? 0.5 : 0.0) + ub_extra + (introspect ? 0.25 : 0.0);
+    const double base_reserve_no_intro = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25)
+                                         + (wide || causal_vision ? 0.5 : 0.0) + ub_extra;
+    const double base_reserve = base_reserve_no_intro + (introspect ? 0.25 : 0.0);
     p.reserve_gib = base_reserve;
 
     // The longest context first, and at each length the best cache that fits.
@@ -467,33 +468,52 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
 
     // When VRAM is still near full (!fits or ctx < ctx_cap or headroom < 0.5 GiB) and disk overflow is
     // enabled ("auto" / "on"), drop compute ubatch 64->32 & disable RAM prompt checkpoints (-ctxcp 0)
-    // to reclaim ~0.17 GiB, while enforcing a 0.15 GiB PS5 OS/internal-memory safety floor so
-    // near-full models step down cleanly instead of crashing mid-decode.
+    // to reclaim ~0.17 GiB plus the unused RAM checkpoint (`p.state_gib`), while enforcing a 0.15 GiB
+    // PS5 OS/internal-memory safety floor so near-full models fit reliably instead of crashing mid-decode.
     if (allow_overflow_fit && !wide && !causal_vision && ubatch == kPromptUbatch
         && (!p.fits || (p.ctx < ctx_cap && (budget_gib - p.total_gib) < 0.5))) {
         const uint32_t tight_ubatch     = 32;
-        const double   tight_reserve    = std::max(0.50, base_reserve - 0.17);
+        const double   ckpt_reclaim     = p.state_gib; // -ctxcp 0 keeps no extra recurrent checkpoint in RAM
+        const double   tight_reserve    = std::max(0.50, base_reserve - 0.17 - ckpt_reclaim);
         const double   effective_budget = std::max(0.0, budget_gib - 0.15);
+        const auto run_tight = [&](double reserve, Plan & out, bool & did_kv_step) {
+            out.fits = false;
+            out.ctx  = 0;
+            did_kv_step = false;
+            const char * try_type = (kv_force && dmode != "on" && p.fits && p.kv_type != "q4_0") ? kv_force : nullptr;
+            try_fit(try_type, tight_ubatch, reserve, effective_budget, out);
+            if ((!out.fits || out.ctx < ctx_cap) && try_type && std::strcmp(try_type, "q4_0") != 0) {
+                Plan tight_q4 = out;
+                tight_q4.fits = false;
+                tight_q4.ctx  = 0;
+                try_fit("q4_0", tight_ubatch, reserve, effective_budget, tight_q4);
+                if (tight_q4.fits && (!out.fits || tight_q4.ctx > out.ctx)) {
+                    out = tight_q4;
+                    did_kv_step = true;
+                }
+            }
+        };
         Plan tight_plan = p;
-        tight_plan.fits = false;
-        tight_plan.ctx  = 0;
-        const char * try_type = (kv_force && dmode != "on" && p.fits && p.kv_type != "q4_0") ? kv_force : nullptr;
-        try_fit(try_type, tight_ubatch, tight_reserve, effective_budget, tight_plan);
-        if ((!tight_plan.fits || tight_plan.ctx < ctx_cap) && try_type && std::strcmp(try_type, "q4_0") != 0) {
-            Plan tight_q4 = tight_plan;
-            tight_q4.fits = false;
-            tight_q4.ctx  = 0;
-            try_fit("q4_0", tight_ubatch, tight_reserve, effective_budget, tight_q4);
-            if (tight_q4.fits && (!tight_plan.fits || tight_q4.ctx > tight_plan.ctx)) {
-                tight_plan = tight_q4;
-                overflow_kv_step = true;
+        bool tight_kv_step = false;
+        run_tight(tight_reserve, tight_plan, tight_kv_step);
+        bool dropped_introspect = false;
+        if (introspect && (!tight_plan.fits || (tight_plan.ctx < 8192 && ctx_cap >= 8192))) {
+            const double tight_no_intro_reserve = std::max(0.50, base_reserve_no_intro - 0.17 - ckpt_reclaim);
+            Plan no_intro_plan = p;
+            bool no_intro_kv = false;
+            run_tight(tight_no_intro_reserve, no_intro_plan, no_intro_kv);
+            if (no_intro_plan.fits && (!tight_plan.fits || no_intro_plan.ctx > tight_plan.ctx)) {
+                tight_plan = no_intro_plan;
+                tight_kv_step = no_intro_kv;
+                dropped_introspect = true;
             }
         }
         const bool unsafe_headroom = p.fits && (budget_gib - p.total_gib) < 0.15;
         if (tight_plan.fits && (!p.fits || tight_plan.ctx > p.ctx || unsafe_headroom)) {
-            overflow_kv_step = kv_force && tight_plan.kv_type != kv_force;
+            overflow_kv_step = (kv_force && tight_plan.kv_type != kv_force) || tight_kv_step;
             p = tight_plan;
             compact_compute = true;
+            p.disable_introspect = dropped_introspect;
         }
     }
 

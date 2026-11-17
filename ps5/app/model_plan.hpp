@@ -100,6 +100,7 @@ struct Plan {
     double      state_gib    = 0;
     double      reserve_gib  = 0;   // compute buffers and the CPU side
     double      total_gib    = 0;
+    bool        disable_introspect = false; // dropped 256 MiB introspect budget to fit tight overflow plan
     std::string why;          // one line for the UI
     std::vector<std::string> args;  // full llama-server arguments
 };

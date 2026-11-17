@@ -205,23 +205,36 @@ int main(int argc, char ** argv) {
         assert(cp_intro.fits && std::fabs((cp_intro.reserve_gib - cp.reserve_gib) - 0.25) < 1e-6);
 
         ps5lm::ModelInfo near_full = moe18;
-        near_full.file_bytes = (uint64_t) (10.45 * 1073741824.0);  // 10.45 GiB weights on 11.54 GiB pool
+        near_full.file_bytes = (uint64_t) (10.58 * 1073741824.0);  // 10.58 GiB weights on 11.54 GiB pool
+        near_full.state_bytes = 160ull << 20;
         const ps5lm::Plan safe_p = ps5lm::plan_model(near_full, 11.54, 65536, "auto", ps5lm::kPromptUbatch, nullptr,
                                                       "auto", 4096, "/data/PS5LM/cache/prompts", false);
         assert(safe_p.fits && safe_p.ctx <= 16384 && (11.54 - safe_p.total_gib) >= 0.15);
         assert(has_args(safe_p, "-ub", "32") && has_args(safe_p, "-b", "128"));
 
-        // With introspect enabled on a 10.25 GiB model, both enter tight_plan: reserve rises by 0.25 GiB,
-        // context steps down (32k -> 16k), and both preserve >= 0.15 GiB below budget_gib.
-        near_full.file_bytes = (uint64_t) (10.25 * 1073741824.0);
+        // With introspect enabled on a 10.35 GiB model, both enter tight_plan: reserve rises by 0.25 GiB,
+        // context steps down, and both preserve >= 0.15 GiB below budget_gib.
+        near_full.file_bytes = (uint64_t) (10.35 * 1073741824.0);
+        near_full.state_bytes = 64ull << 20;
         const ps5lm::Plan safe_no_intro = ps5lm::plan_model(near_full, 11.54, 65536, "auto", ps5lm::kPromptUbatch, nullptr,
                                                              "auto", 4096, "/data/PS5LM/cache/prompts", false);
         const ps5lm::Plan safe_intro    = ps5lm::plan_model(near_full, 11.54, 65536, "auto", ps5lm::kPromptUbatch, nullptr,
                                                              "auto", 4096, "/data/PS5LM/cache/prompts", true);
         assert(safe_no_intro.fits && safe_intro.fits);
+        assert(!safe_intro.disable_introspect);
         assert(safe_intro.reserve_gib > safe_no_intro.reserve_gib + 0.24);
         assert((11.54 - safe_no_intro.total_gib) >= 0.15 && (11.54 - safe_intro.total_gib) >= 0.15);
         assert(safe_intro.ctx < safe_no_intro.ctx);
+
+        // Even with introspect enabled in Settings, 18B MoE fits on 11.56 GiB by reclaiming the unused
+        // -ctxcp 0 checkpoint and dropping the 256 MiB introspect buffer when needed.
+        ps5lm::ModelInfo moe18_intro = moe18;
+        moe18_intro.state_bytes = 160ull << 20;
+        const ps5lm::Plan p18_intro = ps5lm::plan_model(moe18_intro, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr,
+                                                          "auto", 8192, "/data/PS5LM/cache/prompts", true);
+        assert(p18_intro.fits && p18_intro.disable_introspect && p18_intro.ctx >= 8192);
+        assert((11.56 - p18_intro.total_gib) >= 0.15);
+        assert(has_args(p18_intro, "-b", "128") && has_args(p18_intro, "--cache-disk", "/data/PS5LM/cache/prompts"));
     }
 
     // Built-in fine-tune presets for the user's installed Hugging Face models:
