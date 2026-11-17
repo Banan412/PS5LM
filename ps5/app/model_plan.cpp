@@ -407,7 +407,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     const bool wide = !m.decision.empty() || (!m.mmproj.empty() && !causal_vision);
     p.ubatch = wide ? 2048 : causal_vision ? kVisionUbatch : std::max<uint32_t>(ubatch, 1);
     const double ub_extra = !wide && p.ubatch > 64 ? (p.ubatch - 64) * (double) m.n_ff * 38.0 / kGiB : 0.0;
-    const double base_reserve_no_intro = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25)
+    const double base_reserve_no_intro = 0.75 + (m.mmproj.empty() ? 0.0 : 0.25)
                                          + (wide || causal_vision ? 0.5 : 0.0) + ub_extra;
     const double base_reserve = base_reserve_no_intro + (introspect ? 0.25 : 0.0);
     p.reserve_gib = base_reserve;
@@ -453,10 +453,10 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     if (dmode != "auto" && dmode != "on" && dmode != "off") {
         dmode = "auto";
     }
-    const bool allow_overflow_fit = m.decision.empty() && (dmode == "auto" || dmode == "on");
+    const bool allow_kv_step = m.decision.empty() && (dmode == "auto" || dmode == "on");
     bool overflow_kv_step = false;
     bool compact_compute  = false;
-    if (allow_overflow_fit && kv_force && std::strcmp(kv_force, "q4_0") != 0 && (!p.fits || p.ctx < ctx_cap)) {
+    if (allow_kv_step && kv_force && std::strcmp(kv_force, "q4_0") != 0 && (!p.fits || p.ctx < ctx_cap)) {
         Plan q4_plan = p;
         q4_plan.fits = false;
         q4_plan.ctx = 0;
@@ -467,25 +467,27 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         }
     }
 
-    // When VRAM is still near full (!fits or ctx < ctx_cap or headroom < 0.5 GiB) and disk overflow is
-    // enabled ("auto" / "on"), drop compute ubatch 64->32 & disable RAM prompt checkpoints (-ctxcp 0)
-    // to reclaim the unused RAM checkpoint (`p.state_gib`) while preserving >= 0.15 GiB safety headroom
-    // at 8k and >= 0.32 GiB at >=16k so PS5 retains real CPU heap / grammar margin.
-    if (allow_overflow_fit && !wide && !causal_vision && ubatch == kPromptUbatch
+    // When VRAM is tight (!fits or ctx < ctx_cap with < 0.5 GiB headroom), drop compute
+    // ubatch 64->32 & disable RAM prompt checkpoints (-ctxcp 0) while preserving >= 0.15 GiB
+    // safety headroom at <= 8k and >= 0.32 GiB at >= 16k so PS5 retains real CPU heap / grammar
+    // margin. These compute/checkpoint savings also run when disk_cache == "off" (without
+    // relaxing an explicit kv_force).
+    if (m.decision.empty() && !wide && !causal_vision && ubatch == kPromptUbatch
         && (!p.fits || (p.ctx < ctx_cap && (budget_gib - p.total_gib) < 0.5))) {
         const uint32_t tight_ubatch     = 32;
-        const double   ckpt_reclaim     = p.state_gib; // -ctxcp 0 keeps no extra recurrent checkpoint in RAM
-        const double   tight_reserve    = std::max(0.50, base_reserve - 0.17 - ckpt_reclaim);
+        const double   tight_reserve    = std::max(0.50, base_reserve - 0.17);
         const double   effective_budget = std::max(0.0, budget_gib - 0.15);
         const double   long_ctx_budget  = std::max(0.0, budget_gib - 0.32);
         const auto run_tight = [&](double reserve, Plan & out, bool & did_kv_step) {
             out.fits = false;
             out.ctx  = 0;
             did_kv_step = false;
-            const char * try_type = (kv_force && dmode != "on" && !(p.fits && p.kv_type == "q4_0")) ? kv_force : nullptr;
+            // Preserve explicit kv_force (e.g. "q8_0") under both "auto" and "on" until q4_0 is
+            // actually needed to unlock a longer context.
+            const char * try_type = kv_force;
             const auto try_pair = [&](uint32_t max_c, double bud, Plan & dst, bool & stepped) {
                 try_fit(try_type, tight_ubatch, reserve, bud, dst, max_c);
-                if ((!dst.fits || dst.ctx < max_c) && try_type && std::strcmp(try_type, "q4_0") != 0) {
+                if (allow_kv_step && (!dst.fits || dst.ctx < max_c) && try_type && std::strcmp(try_type, "q4_0") != 0) {
                     Plan q4 = dst;
                     q4.fits = false;
                     q4.ctx  = 0;
@@ -511,8 +513,9 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         bool tight_kv_step = false;
         run_tight(tight_reserve, tight_plan, tight_kv_step);
         bool dropped_introspect = false;
-        if (introspect && (!tight_plan.fits || (tight_plan.ctx < 8192 && ctx_cap >= 8192))) {
-            const double tight_no_intro_reserve = std::max(0.50, base_reserve_no_intro - 0.17 - ckpt_reclaim);
+        const uint32_t intro_target_ctx = std::min<uint32_t>(ctx_cap, 32768);
+        if (introspect && (!tight_plan.fits || tight_plan.ctx < intro_target_ctx)) {
+            const double tight_no_intro_reserve = std::max(0.50, base_reserve_no_intro - 0.17);
             Plan no_intro_plan = p;
             bool no_intro_kv = false;
             run_tight(tight_no_intro_reserve, no_intro_plan, no_intro_kv);
@@ -545,20 +548,22 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     const bool disk_active = disk_supported && (dmode == "on" || dmode == "auto");
     const bool disk_primary = disk_active && (near_full_vram || dmode == "on");
 
+    const std::string why_suffix = std::string(overflow_kv_step ? " (expanded)" : "") + (disk_primary ? " + disk" : "");
     std::snprintf(why, sizeof(why), "%s%uk context, %s cache%s%s: %.1f of %.1f GiB",
                   m.decision.empty() ? "" : ("decision model (" + m.decision + "), ").c_str(), p.ctx / 1024,
                   p.kv_type.c_str(), m.mmproj.empty() ? "" : ", images",
-                  (overflow_kv_step || compact_compute) ? " (expanded)" : (disk_primary ? " + disk" : ""),
+                  why_suffix.c_str(),
                   p.total_gib, budget_gib);
     p.why = why;
 
-    // Keep at least a 0.5 GiB margin when allocating RAM prompt cache; when VRAM is
+    // Keep at least a 0.5 GiB margin when allocating RAM prompt cache, bounded to <= 512 MiB
+    // because CPU heap and Vulkan0 share PS5's 12 GiB Direct Memory pool; when VRAM is
     // full/near-full (< 0.75 GiB headroom), run prompt checkpoints purely on disk.
     uint32_t cram_mib = 0;
     uint32_t ctxcp    = compact_compute ? 0 : 1;
     if (dmode != "on" && !near_full_vram && headroom_gib >= 0.75) {
-        cram_mib = std::min<uint32_t>(2048, std::max<uint32_t>(256, (uint32_t) ((headroom_gib - 0.5) * 512.0)));
-        ctxcp = cram_mib >= 1024 ? 8 : 4;
+        cram_mib = std::min<uint32_t>(512, std::max<uint32_t>(256, (uint32_t) ((headroom_gib - 0.5) * 256.0)));
+        ctxcp = 4;
     } else if (dmode == "on" && headroom_gib >= 1.5 && !compact_compute) {
         cram_mib = 256;
         ctxcp = 4;
