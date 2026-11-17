@@ -22,7 +22,17 @@ Settings load_settings(const char * path) {
     s.ctx_cap        = j.value("ctx_cap", s.ctx_cap);
     s.kv_type        = j.value("kv_type", s.kv_type);
     s.disk_cache     = j.value("disk_cache", s.disk_cache);
+    if (s.disk_cache != "auto" && s.disk_cache != "on" && s.disk_cache != "off") {
+        s.disk_cache = "auto";
+    }
     s.disk_cache_mib = j.value("disk_cache_mib", s.disk_cache_mib);
+    if (s.disk_cache_mib == 0) {
+        s.disk_cache_mib = 4096;
+    } else if (s.disk_cache_mib < 512) {
+        s.disk_cache_mib = 512;
+    } else if (s.disk_cache_mib > 32768) {
+        s.disk_cache_mib = 32768;
+    }
     s.sounds        = j.value("sounds", s.sounds);
     s.tools         = j.value("tools", s.tools);
     s.introspect    = j.value("introspect", s.introspect);

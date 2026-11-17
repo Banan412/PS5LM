@@ -446,7 +446,10 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
 
     try_fit(kv_force, p.ubatch, base_reserve, p);
 
-    const std::string dmode = disk_cache_mode ? lower(disk_cache_mode) : "auto";
+    std::string dmode = disk_cache_mode ? lower(disk_cache_mode) : "auto";
+    if (dmode != "auto" && dmode != "on" && dmode != "off") {
+        dmode = "auto";
+    }
     const bool allow_overflow_fit = m.decision.empty() && (dmode == "auto" || dmode == "on");
     bool overflow_kv_step = false;
     bool compact_compute  = false;

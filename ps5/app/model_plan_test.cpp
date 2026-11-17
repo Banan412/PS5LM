@@ -325,5 +325,10 @@ int main(int argc, char ** argv) {
     big.ok = true; big.file_bytes = 20ull << 30; big.n_layer = 32; big.n_head_kv = 8;
     big.key_length = big.value_length = 128;
     assert(!ps5lm::plan_model(big, budget).fits);
+    // Invalid disk_cache_mode falls back to auto; disk_cache_mib == 0 omits --cache-disk.
+    const ps5lm::Plan fb = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "bogus", 2048);
+    assert(fb.fits && has_args(fb, "--cache-disk", "/data/PS5LM/cache/prompts") && has_args(fb, "--cache-disk-mib", "2048"));
+    const ps5lm::Plan zero_mib = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "on", 0);
+    assert(zero_mib.fits && std::find(zero_mib.args.begin(), zero_mib.args.end(), "--cache-disk") == zero_mib.args.end());
     std::puts("model_plan_test: ok");
 }
