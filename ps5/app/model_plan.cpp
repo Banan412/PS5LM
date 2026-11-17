@@ -382,7 +382,7 @@ std::string preset_label_for(const ModelInfo & m, const char * preset_cache_dir)
 
 Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force, uint32_t ubatch,
                 const char * preset_cache_dir, const char * disk_cache_mode, uint32_t disk_cache_mib,
-                const char * disk_cache_dir) {
+                const char * disk_cache_dir, bool introspect) {
     Plan p;
     FetchedPreset sidecar;
     const bool    has_sidecar = m.decision.empty() && !m.path.empty() &&
@@ -407,13 +407,14 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     const bool wide = !m.decision.empty() || (!m.mmproj.empty() && !causal_vision);
     p.ubatch = wide ? 2048 : causal_vision ? kVisionUbatch : std::max<uint32_t>(ubatch, 1);
     const double ub_extra = !wide && p.ubatch > 64 ? (p.ubatch - 64) * (double) m.n_ff * 38.0 / kGiB : 0.0;
-    const double base_reserve = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25) + (wide || causal_vision ? 0.5 : 0.0) + ub_extra;
+    const double base_reserve = 0.75 + p.state_gib + (m.mmproj.empty() ? 0.0 : 0.25)
+                              + (wide || causal_vision ? 0.5 : 0.0) + ub_extra + (introspect ? 0.25 : 0.0);
     p.reserve_gib = base_reserve;
 
     // The longest context first, and at each length the best cache that fits.
     static const uint32_t ctxs[]  = { 262144, 196608, 131072, 65536, 32768, 16384, 8192, 4096 };
     static const char *   types[] = { "f16", "q8_0", "q4_0" };
-    const auto try_fit = [&](const char * only_type, uint32_t plan_ubatch, double reserve, Plan & out) {
+    const auto try_fit = [&](const char * only_type, uint32_t plan_ubatch, double reserve, double fit_budget, Plan & out) {
         for (uint32_t ctx : ctxs) {
             if (ctx > ctx_cap) {
                 continue;
@@ -430,7 +431,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
                 const double   kv         = (kv_bytes_per_token(m, t) * ctx +
                                      m.n_swa_layers * kv_bytes_per_layer_token(m, t) * swa_tokens) / kGiB;
                 const double total = p.weights_gib + kv + p.state_gib + reserve;
-                if (total <= budget_gib) {
+                if (total <= fit_budget) {
                     out.fits = true;
                     out.ctx = ctx;
                     out.ubatch = plan_ubatch;
@@ -444,7 +445,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         }
     };
 
-    try_fit(kv_force, p.ubatch, base_reserve, p);
+    try_fit(kv_force, p.ubatch, base_reserve, budget_gib, p);
 
     std::string dmode = disk_cache_mode ? lower(disk_cache_mode) : "auto";
     if (dmode != "auto" && dmode != "on" && dmode != "off") {
@@ -457,39 +458,40 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         Plan q4_plan = p;
         q4_plan.fits = false;
         q4_plan.ctx = 0;
-        try_fit("q4_0", p.ubatch, base_reserve, q4_plan);
+        try_fit("q4_0", p.ubatch, base_reserve, budget_gib, q4_plan);
         if (q4_plan.fits && (!p.fits || q4_plan.ctx > p.ctx)) {
             p = q4_plan;
             overflow_kv_step = true;
         }
     }
 
-    // When VRAM is still near full (!fits or ctx < ctx_cap or headroom < 0.35 GiB) and disk overflow is
+    // When VRAM is still near full (!fits or ctx < ctx_cap or headroom < 0.5 GiB) and disk overflow is
     // enabled ("auto" / "on"), drop compute ubatch 64->32 & disable RAM prompt checkpoints (-ctxcp 0)
-    // to reclaim ~0.17 GiB for larger models and longer contexts without crashing.
+    // to reclaim ~0.17 GiB, while enforcing a 0.15 GiB PS5 OS/internal-memory safety floor so
+    // near-full models step down cleanly instead of crashing mid-decode.
     if (allow_overflow_fit && !wide && !causal_vision && ubatch == kPromptUbatch
         && (!p.fits || (p.ctx < ctx_cap && (budget_gib - p.total_gib) < 0.5))) {
-        const uint32_t tight_ubatch  = 32;
-        const double   tight_reserve = std::max(0.50, base_reserve - 0.17);
+        const uint32_t tight_ubatch     = 32;
+        const double   tight_reserve    = std::max(0.50, base_reserve - 0.17);
+        const double   effective_budget = std::max(0.0, budget_gib - 0.15);
         Plan tight_plan = p;
         tight_plan.fits = false;
         tight_plan.ctx  = 0;
         const char * try_type = (kv_force && dmode != "on" && p.fits && p.kv_type != "q4_0") ? kv_force : nullptr;
-        try_fit(try_type, tight_ubatch, tight_reserve, tight_plan);
+        try_fit(try_type, tight_ubatch, tight_reserve, effective_budget, tight_plan);
         if ((!tight_plan.fits || tight_plan.ctx < ctx_cap) && try_type && std::strcmp(try_type, "q4_0") != 0) {
             Plan tight_q4 = tight_plan;
             tight_q4.fits = false;
             tight_q4.ctx  = 0;
-            try_fit("q4_0", tight_ubatch, tight_reserve, tight_q4);
+            try_fit("q4_0", tight_ubatch, tight_reserve, effective_budget, tight_q4);
             if (tight_q4.fits && (!tight_plan.fits || tight_q4.ctx > tight_plan.ctx)) {
                 tight_plan = tight_q4;
                 overflow_kv_step = true;
             }
         }
-        if (tight_plan.fits && (!p.fits || tight_plan.ctx > p.ctx)) {
-            if (tight_plan.kv_type == "q4_0" && kv_force && std::strcmp(kv_force, "q4_0") != 0) {
-                overflow_kv_step = true;
-            }
+        const bool unsafe_headroom = p.fits && (budget_gib - p.total_gib) < 0.15;
+        if (tight_plan.fits && (!p.fits || tight_plan.ctx > p.ctx || unsafe_headroom)) {
+            overflow_kv_step = kv_force && tight_plan.kv_type != kv_force;
             p = tight_plan;
             compact_compute = true;
         }
@@ -528,9 +530,13 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         ctxcp = 4;
     }
 
+    const uint32_t min_batch = (compact_compute || headroom_gib < 0.5) ? 128 : 256;
+    const uint32_t batch_arg = causal_vision ? kVisionImageCap
+                             : wide          ? std::max<uint32_t>(256, p.ubatch)
+                                             : std::max<uint32_t>(min_batch, p.ubatch);
     p.args = { "-m", m.path, "-ngl", "999", "-fit", "off", "-lm", "none",
                "-c", std::to_string(p.ctx), "-fa", "on", "-ctk", p.kv_type, "-ctv", p.kv_type,
-               "-b", std::to_string(causal_vision ? kVisionImageCap : std::max<uint32_t>(256, p.ubatch)),
+               "-b", std::to_string(batch_arg),
                "-ub", std::to_string(p.ubatch), "-np", "1",
                "-ctxcp", std::to_string(ctxcp), "-cram", std::to_string(cram_mib),
                "--host", "0.0.0.0", "--port", "8081" };

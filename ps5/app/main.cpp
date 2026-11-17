@@ -700,7 +700,8 @@ struct Models {
                 continue;
             }
             const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv, kPromptUbatch, preset_cache.c_str(),
-                                      settings.disk_cache.c_str(), settings.disk_cache_mib, disk_cache_dir.c_str());
+                                      settings.disk_cache.c_str(), settings.disk_cache_mib, disk_cache_dir.c_str(),
+                                      settings.introspect);
             row.arch = m.arch;
             row.plan = p.why;
             row.fits = p.fits;
@@ -728,7 +729,8 @@ struct Models {
         const std::string disk_cache_dir = data_path("cache/prompts");
         const ModelInfo m = read_model_info(path);
         const Plan p = plan_model(m, budget_gib, settings.ctx_cap, kv_force(), kPromptUbatch, preset_cache.c_str(),
-                                  settings.disk_cache.c_str(), settings.disk_cache_mib, disk_cache_dir.c_str());
+                                  settings.disk_cache.c_str(), settings.disk_cache_mib, disk_cache_dir.c_str(),
+                                  settings.introspect);
         model_part.model_label = base_name(path);
         model_part.model_file  = path;
         model_part.plan        = p.why;
@@ -1321,7 +1323,8 @@ int main(int, char **) {
             models.settings = dash.settings();
             save_settings(g_files.settings.c_str(), models.settings);
             if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type
-                || was.disk_cache != models.settings.disk_cache || was.disk_cache_mib != models.settings.disk_cache_mib) {
+                || was.disk_cache != models.settings.disk_cache || was.disk_cache_mib != models.settings.disk_cache_mib
+                || was.introspect != models.settings.introspect) {
                 models.rescan(stats);
             }
             ps5lm::log_line("settings saved\n");

@@ -189,10 +189,40 @@ int main(int argc, char ** argv) {
     moe18.state_bytes = 64ull << 20;
     const ps5lm::Plan p18_auto = ps5lm::plan_model(moe18, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "auto", 4096);
     const ps5lm::Plan p18_on   = ps5lm::plan_model(moe18, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "on", 4096);
-    assert(p18_auto.fits && p18_auto.ctx >= 8192 && has_args(p18_auto, "-cram", "0") &&
+    assert(p18_auto.fits && p18_auto.ctx >= 8192 && (11.56 - p18_auto.total_gib) >= 0.15 &&
+           has_args(p18_auto, "-cram", "0") &&
            has_args(p18_auto, "--cache-disk", "/data/PS5LM/cache/prompts"));
-    assert(p18_on.fits && p18_on.ctx >= 8192 && has_args(p18_on, "-cram", "0") &&
+    assert(p18_on.fits && p18_on.ctx >= 8192 && (11.56 - p18_on.total_gib) >= 0.15 &&
+           has_args(p18_on, "-cram", "0") &&
            has_args(p18_on, "--cache-disk", "/data/PS5LM/cache/prompts"));
+    assert(has_args(p18_auto, "-b", "128") && has_args(p18_on, "-b", "128"));
+
+    // Introspect adds +0.25 GiB to base_reserve, and tight_plan enforces >= 0.15 GiB
+    // safety margin below budget_gib while capping logical batch -b to 128.
+    {
+        const ps5lm::Plan cp_intro = ps5lm::plan_model(c, budget, 65536, nullptr, ps5lm::kPromptUbatch, nullptr,
+                                                        "auto", 4096, "/data/PS5LM/cache/prompts", true);
+        assert(cp_intro.fits && std::fabs((cp_intro.reserve_gib - cp.reserve_gib) - 0.25) < 1e-6);
+
+        ps5lm::ModelInfo near_full = moe18;
+        near_full.file_bytes = (uint64_t) (10.45 * 1073741824.0);  // 10.45 GiB weights on 11.54 GiB pool
+        const ps5lm::Plan safe_p = ps5lm::plan_model(near_full, 11.54, 65536, "auto", ps5lm::kPromptUbatch, nullptr,
+                                                      "auto", 4096, "/data/PS5LM/cache/prompts", false);
+        assert(safe_p.fits && safe_p.ctx <= 16384 && (11.54 - safe_p.total_gib) >= 0.15);
+        assert(has_args(safe_p, "-ub", "32") && has_args(safe_p, "-b", "128"));
+
+        // With introspect enabled on a 10.25 GiB model, both enter tight_plan: reserve rises by 0.25 GiB,
+        // context steps down (32k -> 16k), and both preserve >= 0.15 GiB below budget_gib.
+        near_full.file_bytes = (uint64_t) (10.25 * 1073741824.0);
+        const ps5lm::Plan safe_no_intro = ps5lm::plan_model(near_full, 11.54, 65536, "auto", ps5lm::kPromptUbatch, nullptr,
+                                                             "auto", 4096, "/data/PS5LM/cache/prompts", false);
+        const ps5lm::Plan safe_intro    = ps5lm::plan_model(near_full, 11.54, 65536, "auto", ps5lm::kPromptUbatch, nullptr,
+                                                             "auto", 4096, "/data/PS5LM/cache/prompts", true);
+        assert(safe_no_intro.fits && safe_intro.fits);
+        assert(safe_intro.reserve_gib > safe_no_intro.reserve_gib + 0.24);
+        assert((11.54 - safe_no_intro.total_gib) >= 0.15 && (11.54 - safe_intro.total_gib) >= 0.15);
+        assert(safe_intro.ctx < safe_no_intro.ctx);
+    }
 
     // Built-in fine-tune presets for the user's installed Hugging Face models:
     {

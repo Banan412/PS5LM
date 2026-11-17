@@ -110,7 +110,8 @@ struct Plan {
 Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap = 65536, const char * kv_force = nullptr,
                 uint32_t ubatch = kPromptUbatch, const char * preset_cache_dir = nullptr,
                 const char * disk_cache_mode = "auto", uint32_t disk_cache_mib = 4096,
-                const char * disk_cache_dir = "/data/PS5LM/cache/prompts");
+                const char * disk_cache_dir = "/data/PS5LM/cache/prompts",
+                bool introspect = false);
 
 // Every .gguf in the given folders (not recursive), sorted by name. Split
 // files are listed by their first part only.
