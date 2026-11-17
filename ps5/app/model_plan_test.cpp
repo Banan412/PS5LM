@@ -176,12 +176,17 @@ int main(int argc, char ** argv) {
     const ps5lm::Plan no_disk = ps5lm::plan_model(c, budget, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "off");
     assert(no_disk.fits && std::find(no_disk.args.begin(), no_disk.args.end(), "--cache-disk") == no_disk.args.end());
 
-    // Near-full VRAM with fixed q8_0 expands to a longer context via q4_0 automatically when disk overflow is "auto".
-    const double tight_budget = 6.55;
+    // Near-full VRAM with fixed q8_0 honors q8_0 when >= 8k fits in "auto" mode, and expands
+    // via q4_0 when q8_0 cannot reach 8k or when disk_cache == "on".
+    const double tight_budget = 6.05;
     const ps5lm::Plan strict_q8 = ps5lm::plan_model(c, tight_budget, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "off");
     const ps5lm::Plan auto_exp  = ps5lm::plan_model(c, tight_budget, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "auto", 4096);
     assert(auto_exp.fits && (!strict_q8.fits || auto_exp.ctx > strict_q8.ctx) && auto_exp.kv_type == "q4_0");
     assert(has_args(auto_exp, "-cram", "0") && has_args(auto_exp, "--cache-disk", "/data/PS5LM/cache/prompts"));
+    const ps5lm::Plan keep_q8_auto = ps5lm::plan_model(c, 6.55, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "auto", 4096);
+    const ps5lm::Plan max_ctx_on   = ps5lm::plan_model(c, 6.55, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "on", 4096);
+    assert(keep_q8_auto.fits && keep_q8_auto.ctx == 8192 && keep_q8_auto.kv_type == "q8_0");
+    assert(max_ctx_on.fits && max_ctx_on.ctx == 16384 && max_ctx_on.kv_type == "q4_0");
 
     // 18B MoE (~10.59 GiB) on 11.56 GiB free pool must fit with >= 8k context across "auto", "on", and "off".
     ps5lm::ModelInfo moe18 = c;
@@ -269,13 +274,16 @@ int main(int argc, char ** argv) {
         real18.n_layer = 40;
         real18.n_head_kv = 2;
         real18.state_bytes = 65863680ull;  // ~62.81 MiB
-        const ps5lm::Plan p18_32k_auto = ps5lm::plan_model(real18, 11.75, 65536, nullptr, ps5lm::kPromptUbatch, nullptr,
+        const ps5lm::Plan p18_32k_auto = ps5lm::plan_model(real18, 11.7475, 65536, nullptr, ps5lm::kPromptUbatch, nullptr,
                                                              "auto", 2048, "/data/PS5LM/cache/prompts", true);
-        const ps5lm::Plan p18_16k_off  = ps5lm::plan_model(real18, 11.75, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr,
+        const ps5lm::Plan p18_16k_q8   = ps5lm::plan_model(real18, 11.7475, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr,
+                                                             "auto", 2048, "/data/PS5LM/cache/prompts", true);
+        const ps5lm::Plan p18_16k_off  = ps5lm::plan_model(real18, 11.7475, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr,
                                                              "off", 2048, "/data/PS5LM/cache/prompts", true);
-        const ps5lm::Plan p18_32k_on   = ps5lm::plan_model(real18, 11.75, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr,
+        const ps5lm::Plan p18_32k_on   = ps5lm::plan_model(real18, 11.7475, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr,
                                                              "on", 2048, "/data/PS5LM/cache/prompts", true);
         assert(p18_32k_auto.fits && p18_32k_auto.disable_introspect && p18_32k_auto.ctx == 32768 && p18_32k_auto.kv_type == "q4_0");
+        assert(p18_16k_q8.fits && p18_16k_q8.disable_introspect && p18_16k_q8.ctx == 16384 && p18_16k_q8.kv_type == "q8_0");
         assert(p18_16k_off.fits && p18_16k_off.disable_introspect && p18_16k_off.ctx == 16384 && p18_16k_off.kv_type == "q8_0");
         assert(p18_32k_on.fits && p18_32k_on.disable_introspect && p18_32k_on.ctx == 32768 && p18_32k_on.kv_type == "q4_0");
         assert(p18_32k_on.why.find(" (expanded) + disk") != std::string::npos);

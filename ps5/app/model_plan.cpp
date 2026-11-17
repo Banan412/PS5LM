@@ -457,9 +457,12 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         dmode = "auto";
     }
     const bool allow_kv_step = m.decision.empty() && (dmode == "auto" || dmode == "on");
+    const uint32_t min_honored_ctx = std::min<uint32_t>(ctx_cap, 8192);
+    const bool step_for_longer = (dmode == "on");
     bool overflow_kv_step = false;
     bool compact_compute  = false;
-    if (allow_kv_step && kv_force && std::strcmp(kv_force, "q4_0") != 0 && (!p.fits || p.ctx < ctx_cap)) {
+    if (allow_kv_step && kv_force && std::strcmp(kv_force, "q4_0") != 0
+        && (!p.fits || (step_for_longer ? p.ctx < ctx_cap : p.ctx < min_honored_ctx))) {
         Plan q4_plan = p;
         q4_plan.fits = false;
         q4_plan.ctx = 0;
@@ -481,36 +484,33 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         const double   tight_reserve    = std::max(0.50, base_reserve - 0.17);
         const double   effective_budget = std::max(0.0, budget_gib - 0.15);
         const double   long_ctx_budget  = std::max(0.0, budget_gib - 0.32);
-        const auto run_tight = [&](double reserve, Plan & out, bool & did_kv_step) {
+        const auto run_tight_for_type = [&](const char * type, double reserve, Plan & out) {
             out.fits = false;
             out.ctx  = 0;
-            did_kv_step = false;
-            // Preserve explicit kv_force (e.g. "q8_0") under both "auto" and "on" until q4_0 is
-            // actually needed to unlock a longer context.
-            const char * try_type = kv_force;
-            const auto try_pair = [&](uint32_t max_c, double bud, Plan & dst, bool & stepped) {
-                try_fit(try_type, tight_ubatch, reserve, bud, dst, max_c);
-                if (allow_kv_step && (!dst.fits || dst.ctx < max_c) && try_type && std::strcmp(try_type, "q4_0") != 0) {
-                    Plan q4 = dst;
-                    q4.fits = false;
-                    q4.ctx  = 0;
-                    try_fit("q4_0", tight_ubatch, reserve, bud, q4, max_c);
-                    if (q4.fits && (!dst.fits || q4.ctx > dst.ctx)) {
-                        dst = q4;
-                        stepped = true;
-                    }
-                }
-            };
             if (ctx_cap >= 16384) {
-                try_pair(ctx_cap, long_ctx_budget, out, did_kv_step);
+                try_fit(type, tight_ubatch, reserve, long_ctx_budget, out, ctx_cap);
                 if (out.fits && out.ctx >= 16384) {
                     return;
                 }
                 out.fits = false;
                 out.ctx  = 0;
-                did_kv_step = false;
             }
-            try_pair(std::min<uint32_t>(ctx_cap, 8192), effective_budget, out, did_kv_step);
+            try_fit(type, tight_ubatch, reserve, effective_budget, out, std::min<uint32_t>(ctx_cap, 8192));
+        };
+        const auto run_tight = [&](double reserve, Plan & out, bool & did_kv_step) {
+            did_kv_step = false;
+            // Honor an explicit kv_force (e.g. "q8_0") when it reaches >= 8k in "auto" mode;
+            // only step down to q4_0 when kv_force cannot fit >= 8k or disk_cache == "on".
+            run_tight_for_type(kv_force, reserve, out);
+            const bool need_step = !out.fits || (step_for_longer ? out.ctx < ctx_cap : out.ctx < min_honored_ctx);
+            if (allow_kv_step && need_step && kv_force && std::strcmp(kv_force, "q4_0") != 0) {
+                Plan q4 = out;
+                run_tight_for_type("q4_0", reserve, q4);
+                if (q4.fits && (!out.fits || q4.ctx > out.ctx)) {
+                    out = q4;
+                    did_kv_step = true;
+                }
+            }
         };
         Plan tight_plan = p;
         bool tight_kv_step = false;
