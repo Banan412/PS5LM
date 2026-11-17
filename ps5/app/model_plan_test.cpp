@@ -210,7 +210,18 @@ int main(int argc, char ** argv) {
         const ps5lm::Plan safe_p = ps5lm::plan_model(near_full, 11.54, 65536, "auto", ps5lm::kPromptUbatch, nullptr,
                                                       "auto", 4096, "/data/PS5LM/cache/prompts", false);
         assert(safe_p.fits && safe_p.ctx <= 16384 && (11.54 - safe_p.total_gib) >= 0.15);
+        if (safe_p.ctx >= 16384) {
+            assert((11.54 - safe_p.total_gib) >= 0.32);
+        }
         assert(has_args(safe_p, "-ub", "32") && has_args(safe_p, "-b", "128"));
+
+        // An 18B-style tight fit cannot promote 16k without preserving >= 0.32 GiB planner headroom.
+        ps5lm::ModelInfo near_16k = moe18;
+        near_16k.file_bytes = (uint64_t) (10.55 * 1073741824.0);
+        near_16k.state_bytes = 64ull << 20;
+        const ps5lm::Plan p16 = ps5lm::plan_model(near_16k, 11.54, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr,
+                                                  "auto", 8192, "/data/PS5LM/cache/prompts", false);
+        assert(p16.fits && (p16.ctx < 16384 || (11.54 - p16.total_gib) >= 0.32));
 
         // With introspect enabled on a 10.35 GiB model, both enter tight_plan: reserve rises by 0.25 GiB,
         // context steps down, and both preserve >= 0.15 GiB below budget_gib.

@@ -415,9 +415,10 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
     // The longest context first, and at each length the best cache that fits.
     static const uint32_t ctxs[]  = { 262144, 196608, 131072, 65536, 32768, 16384, 8192, 4096 };
     static const char *   types[] = { "f16", "q8_0", "q4_0" };
-    const auto try_fit = [&](const char * only_type, uint32_t plan_ubatch, double reserve, double fit_budget, Plan & out) {
+    const auto try_fit = [&](const char * only_type, uint32_t plan_ubatch, double reserve, double fit_budget, Plan & out, uint32_t max_ctx = 0) {
+        const uint32_t limit = max_ctx ? std::min(ctx_cap, max_ctx) : ctx_cap;
         for (uint32_t ctx : ctxs) {
-            if (ctx > ctx_cap) {
+            if (ctx > limit) {
                 continue;
             }
             for (const char * t : types) {
@@ -425,7 +426,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
                     continue;
                 }
                 // f16 only where it is cheap: q8_0 costs nothing measurable in quality.
-                if (!only_type && std::strcmp(t, "f16") == 0 && ctx > 8192) {
+                if (!only_type && std::strcmp(t, "f16") == 0 && (ctx > 8192 || plan_ubatch < kPromptUbatch)) {
                     continue;
                 }
                 const uint32_t swa_tokens = std::min(ctx, (m.swa_window + plan_ubatch + 255) / 256 * 256);
@@ -468,30 +469,43 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
 
     // When VRAM is still near full (!fits or ctx < ctx_cap or headroom < 0.5 GiB) and disk overflow is
     // enabled ("auto" / "on"), drop compute ubatch 64->32 & disable RAM prompt checkpoints (-ctxcp 0)
-    // to reclaim ~0.17 GiB plus the unused RAM checkpoint (`p.state_gib`), while enforcing a 0.15 GiB
-    // PS5 OS/internal-memory safety floor so near-full models fit reliably instead of crashing mid-decode.
+    // to reclaim the unused RAM checkpoint (`p.state_gib`) while preserving >= 0.15 GiB safety headroom
+    // at 8k and >= 0.32 GiB at >=16k so PS5 retains real CPU heap / grammar margin.
     if (allow_overflow_fit && !wide && !causal_vision && ubatch == kPromptUbatch
         && (!p.fits || (p.ctx < ctx_cap && (budget_gib - p.total_gib) < 0.5))) {
         const uint32_t tight_ubatch     = 32;
         const double   ckpt_reclaim     = p.state_gib; // -ctxcp 0 keeps no extra recurrent checkpoint in RAM
         const double   tight_reserve    = std::max(0.50, base_reserve - 0.17 - ckpt_reclaim);
         const double   effective_budget = std::max(0.0, budget_gib - 0.15);
+        const double   long_ctx_budget  = std::max(0.0, budget_gib - 0.32);
         const auto run_tight = [&](double reserve, Plan & out, bool & did_kv_step) {
             out.fits = false;
             out.ctx  = 0;
             did_kv_step = false;
-            const char * try_type = (kv_force && dmode != "on" && p.fits && p.kv_type != "q4_0") ? kv_force : nullptr;
-            try_fit(try_type, tight_ubatch, reserve, effective_budget, out);
-            if ((!out.fits || out.ctx < ctx_cap) && try_type && std::strcmp(try_type, "q4_0") != 0) {
-                Plan tight_q4 = out;
-                tight_q4.fits = false;
-                tight_q4.ctx  = 0;
-                try_fit("q4_0", tight_ubatch, reserve, effective_budget, tight_q4);
-                if (tight_q4.fits && (!out.fits || tight_q4.ctx > out.ctx)) {
-                    out = tight_q4;
-                    did_kv_step = true;
+            const char * try_type = (kv_force && dmode != "on" && !(p.fits && p.kv_type == "q4_0")) ? kv_force : nullptr;
+            const auto try_pair = [&](uint32_t max_c, double bud, Plan & dst, bool & stepped) {
+                try_fit(try_type, tight_ubatch, reserve, bud, dst, max_c);
+                if ((!dst.fits || dst.ctx < max_c) && try_type && std::strcmp(try_type, "q4_0") != 0) {
+                    Plan q4 = dst;
+                    q4.fits = false;
+                    q4.ctx  = 0;
+                    try_fit("q4_0", tight_ubatch, reserve, bud, q4, max_c);
+                    if (q4.fits && (!dst.fits || q4.ctx > dst.ctx)) {
+                        dst = q4;
+                        stepped = true;
+                    }
                 }
+            };
+            if (ctx_cap >= 16384) {
+                try_pair(ctx_cap, long_ctx_budget, out, did_kv_step);
+                if (out.fits && out.ctx >= 16384) {
+                    return;
+                }
+                out.fits = false;
+                out.ctx  = 0;
+                did_kv_step = false;
             }
+            try_pair(std::min<uint32_t>(ctx_cap, 8192), effective_budget, out, did_kv_step);
         };
         Plan tight_plan = p;
         bool tight_kv_step = false;
