@@ -102,8 +102,8 @@ constexpr SettingCategory kCategories[] = {
     { "Model",
       { { Setting::ctx_cap, "Longest context", "The longest that fits, up to this; applies at the next load" },
         { Setting::kv_type, "Context cache", "Auto picks the best that fits; a fixed type trades length for quality" },
-        { Setting::disk_cache, "Disk cache spillover", "Auto moves prompt cache to SSD & expands context when VRAM is near full" },
-        { Setting::disk_cache_mib, "Disk cache limit", "How much SSD space to reserve for saved prompt checkpoints" } },
+        { Setting::disk_cache, "Disk cache spillover", "Move prompt checkpoints to SSD to free RAM and expand tight-VRAM context" },
+        { Setting::disk_cache_mib, "Disk cache limit", "SSD space reserved for saved prompt checkpoints (2 GB - 32 GB)" } },
       4 },
     { "Chat",
       { { Setting::tools, "File tools", "The browser chat may read and write files in /data/PS5LM/scratch" },
@@ -499,9 +499,9 @@ std::vector<Choice> choices_of(const Settings & s, Setting id, const std::vector
         case Setting::disk_cache: {
             const char * labels[] = { "Auto (when near full)", "Always on", "Off" };
             const char * notes[] = {
-                "Spill cache to disk & step down KV when VRAM is tight",
-                "Keep prompt checkpoints on SSD with minimal RAM cache",
-                "Keep prompt cache in RAM only (no disk spillover)"
+                "Use SSD prompt cache & tight packing when near full; keep KV quality at >= 8k",
+                "Keep prompt cache on SSD for all models & step down KV cache for longest context",
+                "Keep prompt cache & standard compute buffers in RAM (no SSD spillover)"
             };
             for (int i = 0; i < 3; ++i) {
                 const std::string mode = kDiskCacheSteps[i];

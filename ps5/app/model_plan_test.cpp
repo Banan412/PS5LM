@@ -188,7 +188,8 @@ int main(int argc, char ** argv) {
     assert(keep_q8_auto.fits && keep_q8_auto.ctx == 8192 && keep_q8_auto.kv_type == "q8_0");
     assert(max_ctx_on.fits && max_ctx_on.ctx == 16384 && max_ctx_on.kv_type == "q4_0");
 
-    // 18B MoE (~10.59 GiB) on 11.56 GiB free pool must fit with >= 8k context across "auto", "on", and "off".
+    // 18B MoE (~10.59 GiB) on 11.56 GiB free pool: "auto"/"on" fit >= 8k via tight disk packing;
+    // "off" keeps standard RAM buffers (-ub 64, -ctxcp 1) without --cache-disk and at shorter context.
     ps5lm::ModelInfo moe18 = c;
     moe18.arch       = "qwen35moe";
     moe18.file_name  = "qwen3.5-18b-a3b-reap-coding-heretic-v0.i1-Q4_K_M.gguf";
@@ -199,7 +200,7 @@ int main(int argc, char ** argv) {
     const ps5lm::Plan p18_auto = ps5lm::plan_model(moe18, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "auto", 4096);
     const ps5lm::Plan p18_on   = ps5lm::plan_model(moe18, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "on", 4096);
     const ps5lm::Plan p18_off  = ps5lm::plan_model(moe18, 11.56, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr, "off", 4096,
-                                                   "/data/PS5LM/cache/prompts", true);
+                                                   "/data/PS5LM/cache/prompts", false);
     assert(p18_auto.fits && p18_auto.ctx >= 8192 && p18_auto.kv_type == "q8_0" && (11.56 - p18_auto.total_gib) >= 0.15 &&
            has_args(p18_auto, "-cram", "0") &&
            has_args(p18_auto, "--cache-disk", "/data/PS5LM/cache/prompts"));
@@ -207,8 +208,8 @@ int main(int argc, char ** argv) {
            has_args(p18_on, "-cram", "0") &&
            has_args(p18_on, "--cache-disk", "/data/PS5LM/cache/prompts"));
     assert(p18_on.why.find(" + disk") != std::string::npos && p18_on.why.find("(expanded)") == std::string::npos);
-    assert(p18_off.fits && p18_off.ctx >= 8192 && p18_off.kv_type == "q8_0" && p18_off.disable_introspect &&
-           (11.56 - p18_off.total_gib) >= 0.15 && has_args(p18_off, "-ub", "32") && has_args(p18_off, "-ctxcp", "0") &&
+    assert(p18_off.fits && p18_off.ctx <= p18_auto.ctx && p18_off.kv_type == "q8_0" && !p18_off.disable_introspect &&
+           has_args(p18_off, "-ub", "64") &&
            std::find(p18_off.args.begin(), p18_off.args.end(), "--cache-disk") == p18_off.args.end() &&
            p18_off.why.find("(expanded)") == std::string::npos && p18_off.why.find("+ disk") == std::string::npos);
     assert(has_args(p18_auto, "-b", "128") && has_args(p18_on, "-b", "128") && has_args(p18_off, "-b", "128"));
@@ -268,8 +269,8 @@ int main(int argc, char ** argv) {
         assert(safe_intro.ctx < safe_no_intro.ctx);
 
         // With 256 MiB flexibleMemorySize (~11.75 GiB free Direct Memory), real 18B-A3B (40 layers,
-        // 2 KV heads, 10 KV layers) unlocks 32k q4_0 (or 16k q8_0 with disk_cache "off") by
-        // auto-disabling introspect instead of stopping at 8k.
+        // 2 KV heads, 10 KV layers) clearly distinguishes all 3 modes: "off" < "auto" (16k q8_0 + disk)
+        // < "on" (32k q4_0 expanded + disk).
         ps5lm::ModelInfo real18 = moe18;
         real18.n_layer = 40;
         real18.n_head_kv = 2;
@@ -278,13 +279,14 @@ int main(int argc, char ** argv) {
                                                              "auto", 2048, "/data/PS5LM/cache/prompts", true);
         const ps5lm::Plan p18_16k_q8   = ps5lm::plan_model(real18, 11.7475, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr,
                                                              "auto", 2048, "/data/PS5LM/cache/prompts", true);
-        const ps5lm::Plan p18_16k_off  = ps5lm::plan_model(real18, 11.7475, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr,
+        const ps5lm::Plan p18_8k_off   = ps5lm::plan_model(real18, 11.7475, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr,
                                                              "off", 2048, "/data/PS5LM/cache/prompts", true);
         const ps5lm::Plan p18_32k_on   = ps5lm::plan_model(real18, 11.7475, 65536, "q8_0", ps5lm::kPromptUbatch, nullptr,
                                                              "on", 2048, "/data/PS5LM/cache/prompts", true);
         assert(p18_32k_auto.fits && p18_32k_auto.disable_introspect && p18_32k_auto.ctx == 32768 && p18_32k_auto.kv_type == "q4_0");
         assert(p18_16k_q8.fits && p18_16k_q8.disable_introspect && p18_16k_q8.ctx == 16384 && p18_16k_q8.kv_type == "q8_0");
-        assert(p18_16k_off.fits && p18_16k_off.disable_introspect && p18_16k_off.ctx == 16384 && p18_16k_off.kv_type == "q8_0");
+        assert(p18_8k_off.fits && !p18_8k_off.disable_introspect && p18_8k_off.ctx == 8192 && p18_8k_off.kv_type == "q8_0");
+        assert(p18_8k_off.why.find("+ disk") == std::string::npos);
         assert(p18_32k_on.fits && p18_32k_on.disable_introspect && p18_32k_on.ctx == 32768 && p18_32k_on.kv_type == "q4_0");
         assert(p18_32k_on.why.find(" (expanded) + disk") != std::string::npos);
 

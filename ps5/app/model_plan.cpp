@@ -474,13 +474,13 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         }
     }
 
-    // When VRAM is tight (!fits or ctx < ctx_cap with < 0.5 GiB headroom), drop compute
+    // When disk spillover is enabled and VRAM is tight (!fits or ctx < ctx_cap), drop compute
     // ubatch 64->32 & disable RAM prompt checkpoints (-ctxcp 0) while preserving >= 0.15 GiB
     // safety headroom at <= 8k and >= 0.32 GiB at >= 16k so PS5 retains real CPU heap / grammar
-    // margin. These compute/checkpoint savings also run when disk_cache == "off" (without
-    // relaxing an explicit kv_force).
+    // margin. Keeping this gated on dmode != "off" ensures "Off" preserves RAM checkpoints and
+    // standard compute buffers rather than shrinking context behavior identically to "Auto".
     if (m.decision.empty() && !wide && !causal_vision && ubatch == kPromptUbatch
-        && (!p.fits || p.ctx < ctx_cap)) {
+        && dmode != "off" && (!p.fits || p.ctx < ctx_cap)) {
         const uint32_t tight_ubatch     = 32;
         const double   tight_reserve    = std::max(0.50, base_reserve - 0.17);
         const double   effective_budget = std::max(0.0, budget_gib - 0.15);
@@ -573,7 +573,7 @@ Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const 
         ctxcp = 4;
     }
 
-    const uint32_t min_batch = (compact_compute || headroom_gib < 0.5) ? 128 : 256;
+    const uint32_t min_batch = near_full_vram ? 128 : 256;
     const uint32_t batch_arg = causal_vision ? kVisionImageCap
                              : wide          ? std::max<uint32_t>(256, p.ubatch)
                                              : std::max<uint32_t>(min_batch, p.ubatch);

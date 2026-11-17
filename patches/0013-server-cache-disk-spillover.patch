@@ -453,7 +453,7 @@ index 180984684..f3270aef7 100644
 +        }
 +    }
 +
-+    evict_disk_for(cur_size);
++    evict_disk_for(cur_size + 4096);
 +
 +    // Stream directly tensor-by-tensor onto disk without allocating a giant contiguous RAM buffer.
 +    const uint64_t fid = next_disk_id++;
