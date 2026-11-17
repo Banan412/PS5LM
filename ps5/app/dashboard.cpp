@@ -131,7 +131,7 @@ constexpr int kDiagnostics = 6;
 constexpr uint32_t     kCtxSteps[] = { 4096, 8192, 16384, 32768, 65536, 131072, 196608, 262144 };
 constexpr const char * kKvSteps[] = { "auto", "f16", "q8_0", "q4_0" };
 constexpr const char * kDiskCacheSteps[] = { "auto", "on", "off" };
-constexpr uint32_t     kDiskCacheMibSteps[] = { 2048, 4096, 8192, 16384 };
+constexpr uint32_t     kDiskCacheMibSteps[] = { 2048, 4096, 8192, 16384, 32768 };
 constexpr uint32_t     kScratchSteps[] = { 1, 2, 5, 10, 20 };
 
 constexpr int   kLogLines = 20;
