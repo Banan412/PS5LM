@@ -383,6 +383,9 @@ std::string preset_label_for(const ModelInfo & m, const char * preset_cache_dir)
 Plan plan_model(const ModelInfo & m, double budget_gib, uint32_t ctx_cap, const char * kv_force, uint32_t ubatch,
                 const char * preset_cache_dir, const char * disk_cache_mode, uint32_t disk_cache_mib,
                 const char * disk_cache_dir, bool introspect) {
+    if (kv_force && (*kv_force == '\0' || std::strcmp(kv_force, "auto") == 0)) {
+        kv_force = nullptr;
+    }
     Plan p;
     FetchedPreset sidecar;
     const bool    has_sidecar = m.decision.empty() && !m.path.empty() &&

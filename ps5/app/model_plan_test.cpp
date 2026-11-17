@@ -385,6 +385,21 @@ int main(int argc, char ** argv) {
         rmdir(dir);
     }
 
+    // Nothing fits in too little memory.
+    ps5lm::ModelInfo big;
+    big.ok = true; big.file_bytes = 20ull << 30; big.n_layer = 32; big.n_head_kv = 8;
+    big.key_length = big.value_length = 128;
+    assert(!ps5lm::plan_model(big, budget).fits);
+    // "auto" / "" kv_force normalizes to best-fit even when disk cache is off.
+    const ps5lm::Plan auto_kv_off = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "off");
+    assert(auto_kv_off.fits && auto_kv_off.ctx == cp.ctx && auto_kv_off.kv_type == cp.kv_type);
+    // Invalid disk_cache_mode falls back to auto; disk_cache_mib == 0 omits --cache-disk.
+    const ps5lm::Plan fb = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "bogus", 2048);
+    assert(fb.fits && fb.kv_type == cp.kv_type && has_args(fb, "--cache-disk", "/data/PS5LM/cache/prompts") &&
+           has_args(fb, "--cache-disk-mib", "2048"));
+    const ps5lm::Plan zero_mib = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "on", 0);
+    assert(zero_mib.fits && std::find(zero_mib.args.begin(), zero_mib.args.end(), "--cache-disk") == zero_mib.args.end());
+
     if (argc < 2) {
         std::puts("model_plan_test: ok (synthetic only)");
         return 0;
@@ -417,15 +432,5 @@ int main(int argc, char ** argv) {
         }
     }
     assert(saw_q2k && saw_iq2xxs);
-    // Nothing fits in too little memory.
-    ps5lm::ModelInfo big;
-    big.ok = true; big.file_bytes = 20ull << 30; big.n_layer = 32; big.n_head_kv = 8;
-    big.key_length = big.value_length = 128;
-    assert(!ps5lm::plan_model(big, budget).fits);
-    // Invalid disk_cache_mode falls back to auto; disk_cache_mib == 0 omits --cache-disk.
-    const ps5lm::Plan fb = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "bogus", 2048);
-    assert(fb.fits && has_args(fb, "--cache-disk", "/data/PS5LM/cache/prompts") && has_args(fb, "--cache-disk-mib", "2048"));
-    const ps5lm::Plan zero_mib = ps5lm::plan_model(c, budget, 65536, "auto", ps5lm::kPromptUbatch, nullptr, "on", 0);
-    assert(zero_mib.fits && std::find(zero_mib.args.begin(), zero_mib.args.end(), "--cache-disk") == zero_mib.args.end());
     std::puts("model_plan_test: ok");
 }
