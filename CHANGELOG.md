@@ -12,8 +12,145 @@ v0.1.x are the upstream payload releases by cobanov.
   makes it delete `fleet-worker.txt` and restart as the app, the way a model change
   restarts it. Before, a worker could only quit, and someone had to open PS5LM again
   on the console.
+- **The fleet splits modern models.** Any single-file model the pinned llama.cpp
+  loads as one stack of blocks is admitted. That includes Qwen 3.5/3.6/3.8 (hybrid
+  Gated DeltaNet, dense and MoE), Llama 3.1+, Gemma 3/4 and gpt-oss, in all 35
+  ggml tensor types. Before, only dense `llama` and `qwen2` were admitted.
+  - The estimator now follows llama.cpp's placement and caches: recurrent state,
+    NextN blocks, sliding windows (listed in the file or llama.cpp's own pattern),
+    shared KV, widened V rows without flash attention, and RoPE and layer-0
+    tensors.
+  - It matched `llama-fit-params --fit-print` within 1 MiB on every device for
+    nine models at 4k and 32k. Qwen 3.5 and Gemma 3 split over two RPC workers
+    gave the same greedy tokens as one worker (docs/FLEET.md).
+- Before llama-server starts, `fleet serve` checks the plan with llama.cpp itself:
+  `llama-fit-params --fit-print` against the live workers, compute buffers
+  included. It refuses a worker that would come within 256 MiB of its budget, or
+  an eighth of a smaller budget.
+  `scripts/build-fleet-host.sh` builds `llama-fit-params`.
+- **`python3 -m fleet control`** runs a fleet of any size from one JSON
+  configuration: devices (consoles, this PC's GPUs, other RPC servers), and pools.
+  A pool is one model with its context, slots and cache. Its replicas are layer
+  splits, single consoles that serve the model with PS5LM itself, local GPUs, or
+  servers elsewhere.
+  - **One API** for every pool on port 8081 (OpenAI and Anthropic routes,
+    streaming, an optional key). The request's `model` picks the pool, and the
+    least busy replica gets it.
+  - **Running pools stay up.** It starts their replicas (making consoles workers
+    and starting the GPU's RPC worker as needed) and watches every device and
+    replica. It restarts what fails, with back-off.
+  - **Consoles are switched over the network**: found with the PlayStation
+    discovery protocol (also from WSL), and put in or out of worker mode over FTP.
+  - **`python3 -m fleet ctl`**: the same from a shell or an agent, as JSON:
+    `status`, `pool add --auto`, `pool start --wait`, `device leave`, and
+    `config` / `apply` for the whole configuration.
+  - **A console's worker settings**, on the page or with `ctl device set`:
+    `screen` (off by default, about 350 MiB more for the model) and `cache_gib`
+    (0 by default, no cache, as in the app; set, the GiB of weights its worker
+    keeps, so a reload reads them on the console: 32 holds a 27B model's share).
+    They go into its env.txt; a change restarts an idle worker, and one
+    in use takes it at its next restart. The page shows what each cache holds.
+    New actions: **restart** (a worker as a worker, with its settings) and
+    **clear-cache**.
+  - Consoles keep back 512 MiB for llama.cpp's compute buffers by default, GPUs
+    and RPC servers 1024.
+  - A split restarts its consoles' workers before it loads: the console's driver
+    keeps memory an earlier host allocated, and a second load ran out of it. The
+    watcher does not probe a console while a split on it starts.
+  - Splits sample on the worker with the output layer (`--backend-sampling`):
+    18.4 instead of 16.0 tokens/s for Qwen3.8-27B on a PS5 alone.
+  - A closed or crashed PS5LM is opened from the control server (`launch`, and
+    automatically by splits, `worker` and `restart`), through an ELF loader on
+    the console's port 9021 and PS5LM's launch payload.
+  - A version 1 `control.json` (one list of workers) becomes devices and a stopped
+    pool.
+  - **Who can use it:**
+    - The API is shared on the network (`api_lan`) only with an `api_key`; a
+      configuration without one is refused, when loaded and when changed.
+    - The API sends CORS headers only with a key set. Without one it sends
+      none, drops a replica's own, and refuses requests that carry another
+      site's `Origin`, so a page open in the browser cannot drive a keyless API.
+    - Behind `--allow-host`, the page and `ctl` change things only with a token
+      (`--token` or `$PS5LM_FLEET_TOKEN`; without one, a new token is printed
+      at each start). The page asks for it once; `ctl` takes `--token`. Both
+      also read it from a file that only you can read
+      (`~/.config/ps5lm-fleet/token`, or `--token-file`), so scripts that call
+      `ctl` need no variable.
+    - The launch payload comes from one folder (`build/app-ps5`, or
+      `--launcher-dir`): `launcher` picks a `.elf` in it, and only an ELF is
+      sent. A model given as a path is copied to a console only if it is a GGUF.
+    - A POST with a `Content-Length` that is not a number, negative or over
+      4 MiB is answered 413; a negative one used to wait on the connection.
+- **Long contexts in a split**:
+  - The planner and `fleet serve` take a quantized cache with flash attention
+    (`--cache-type q8_0 --flash-attn on`) and parallel slots, sized as llama.cpp
+    sizes them.
+  - Qwen3.8 27B (Q4_K_XL) ran with a 128k context, q4_0 cache, over one PS5 and an
+    RTX 3080. With a q8_0 cache, 80k fits.
+- Manual layer splits in the planner (`layer_counts`). A split can have one node.
+- **A fleet worker without its screen**: `PS5LM_WORKER_SCREEN=off` in `env.txt`
+  starts a worker without its screen and dashboard. That leaves about 350 MiB more
+  for the model: on a console the worker reported 12,217 MiB free instead of 11,854.
+- **A fleet worker restarts on request**: `/data/PS5LM/unload`, which restarts the
+  app, restarts a worker as a worker. It reads `env.txt` again, so its settings
+  change without anyone at the console.
+- A worker logs its memory once it has started, and when `/data/PS5LM/memory` is there.
+- **A fleet worker can keep the weights hosts send** (`PS5LM_RPC_CACHE_GB` in
+  `env.txt`, off by default): up to that many GiB in `/data/PS5LM/rpc-cache`, the
+  least recently used dropped first. A host loading the same weights again sends
+  only their hashes. On a console, Ornith 1.5 9B loaded in 17.6 s from the
+  cache against 48.9 s without it (its first load, saving the cache, took
+  113 s).
+  - `patches/fleet/0005`: a cache file is written whole under a temporary name,
+    used only when it hashes to what the host sent, and read in 8 MiB reads.
+    Before, a write cut short left a file that later loaded as the weights.
+  - The files are written through ftpsrv: a title's own writes slow to about
+    1.2 MB/s after 2 GB.
+- **Parked state stays on the console** (`PS5LM_PARK_GB` in `env.txt`, 128 GiB
+  unless set, 0 for off; `--slot-park-path` on the host): a host that serves
+  many conversations on one slot parks the one leaving in files on the worker,
+  in `/data/PS5LM/park`, instead of fetching it into its own memory, and loads
+  it back from the console's storage. `POST /slots/N?action=save|restore` with
+  the conversation's name; `park-list`, `park-delete`, `park-status`
+  ([FLEET.md](docs/FLEET.md#parked-state)). On a console serving Qwen3.8-27B
+  a 153K-token conversation came back in 4.6 s (65 s through the host prompt
+  cache) and a hand-over's save took 2.2 s.
+  - A save writes only what was added: the attention cells of the new tokens
+    and one recurrent state. For Qwen3.8-27B that is 18 MiB per 1,000 new tokens
+    plus 150 MiB, where the host prompt cache moved 2.8 GiB each way for a 153K
+    history. The host keeps 28 bytes a token.
+  - The worker drops the least recently used key when the folder is full, by
+    its own record of saves and restores (a console's file times do not move
+    when a key is read), and files are read with `read()` (the console's libc
+    reads an unbuffered stream a byte per call).
+  - `patches/fleet/0009`: park commands in the RPC worker, offered in its
+    handshake, every byte through one 8 MiB buffer, files whole or absent, the
+    folder kept to its size by dropping the key used longest ago.
+    `patches/0015`: a sequence's state in parts, the tensor data left on the
+    device. `patches/0016`: the server's side and its bookkeeping.
+  - A history changed before its parked end is rewritten from the change, never
+    resumed as it was; a save that dies half way leaves the one before loadable.
+  - `scripts/ps5lm-app.sh bench-park` measures the write path: sustained writes
+    through ftpsrv with the speed of every GiB.
+- **Large tensors go to a fleet worker in 8 MiB pieces** (`patches/fleet/0007`).
+  A worker took every tensor write, and built every answer to a read, in one
+  buffer of its size. A host that saved or restored a slot moved whole KV layers
+  that way, and every prompt batch sent an attention mask that grows with the
+  depth: a console serving Qwen3.8-27B with 60 MiB to spare died saving a
+  100K-token history. Split by the host, the same saves and restores ran to
+  153K tokens with the console's free memory unmoved. `GGML_RPC_CHUNK_MB` sets
+  the piece size (0 for off).
+
+- **A host keeps its idle connection to a worker alive** (`patches/fleet/0008`):
+  TCP keepalive on the RPC link, first probe after `GGML_RPC_KEEPALIVE_S`
+  seconds idle (60; 0 for off). A host behind a NAT (WSL2) lost the connection
+  after about half an hour without a request, and llama-server aborted on the
+  next one although the worker was fine.
 
 ### Changed
+- The fleet's llama-server keeps one context checkpoint and no RAM prompt cache
+  (`--ctx-checkpoints 1 --cache-ram 0`): saving either reads caches back from
+  every worker over the network.
 - **Qwen vision models get a narrow ubatch**: a model with a Qwen projector (`clip.projector_type`
   `qwen*`) plans `-ub 256`, `-b 1280` and `--image-max-tokens 1280` instead of the 2048 ubatch,
   and keeps 0.5 GiB of headroom for photos. llama.cpp needs a whole image in one ubatch only for
@@ -52,6 +189,31 @@ v0.1.x are the upstream payload releases by cobanov.
   build against one CPU RPC worker, with and without flash attention.
 
 ### Fixed
+- **A new message after a Qwen3.5 turn no longer processes the whole turn again** (#84). Qwen3.5's
+  chat template renders an assistant message's thinking only after the last user message, so the
+  next user message rendered the turn before it differently and the cache no longer matched: on the
+  console, a 37k-token chat took 190 s before its answer started. llama.cpp keeps the thinking of
+  earlier turns by default (`--reasoning-preserve`) for templates that support it; Qwen3.5's
+  template ignored it, and now honours it (`patches/0013`, in the same place llama.cpp already
+  fixes up other templates): a message has its thinking block wherever it is in the history, and
+  only when it has thinking. A client that sends the thinking back keeps it in the context; Open
+  WebUI without a provider set sends none, and its turns render as Qwen3.5 sees past turns, with no
+  block. `--no-reasoning-preserve` (or `LLAMA_ARG_REASONING_PRESERVE=false` in `env.txt`) restores
+  the template's own behaviour. Measured on the console with the template as shipped, a 4.7k-token
+  agent turn followed by a new message processed all 4,684 tokens again in 10.5 s; with the thinking
+  kept, 52 tokens in 0.2 s; in an Open WebUI chat, a follow-up after an 8.4k-token agent turn
+  processed 37 tokens in 0.2 s. Keeping an empty block on every earlier turn instead made Qwen3.5
+  leave its visible reply empty in 4 of 6 Open WebUI follow-ups, so no empty block is rendered.
+  `tests/test-chat.cpp` checks that a new message only appends and that no empty block is rendered.
+  From @MCsumz's fork, [PS5LM-memfix](https://github.com/MCsumz/PS5LM-memfix).
+- **A fleet worker no longer loses memory with every prompt batch**: llama.cpp's
+  RPC server kept a copy of every graph a host sent (about 4 MiB for a 27B
+  model) until 1,024 had come, and a host sends a new one for nearly every batch
+  of a prompt. A console serving Qwen3.8-27B lost 7.5 to 9 MiB per 1,000 prompt
+  tokens and died after about 175K. `patches/fleet/0006`: the host keeps the 8
+  graphs it used last on each device and tells the worker to free the others.
+  Both the host build and the title need the patch; either alone behaves as
+  before.
 - **Generation no longer flatlines on a log write**: the GPU driver prints a stats line from its
   submission path, and a write to `app.log` on `/data` could block for 9-26 s with the driver's
   lock held; each blocked print made the next one due, so generation stayed stopped until the app

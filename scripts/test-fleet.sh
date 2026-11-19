@@ -25,7 +25,16 @@ if [[ ${1:-} == --rpc ]]; then
     "${CMAKE:-cmake}" -E env CTEST_OUTPUT_ON_FAILURE=1 \
         "$(dirname "$(command -v "${CMAKE:-cmake}")")/ctest" --test-dir "$out" -R '^test-rpc-multi-server$'
     python3 tests/fleet_rpc_no_comm_test.py --binary "$out/bin/ggml-rpc-server"
+    python3 tests/fleet_rpc_graph_free_test.py --binary "$out/bin/ggml-rpc-server"
     python3 tests/fleet_rpc_smoke.py --build "$out"
+    python3 tests/fleet_rpc_cache_test.py --build "$out"
+    python3 tests/fleet_rpc_chunk_test.py --build "$out"
+    python3 tests/fleet_rpc_park_test.py --build "$out"
+    # the same with a real model, when one is named: Qwen3.5-0.8B has the hybrid
+    # layout (attention cells plus a recurrent state) that the consoles serve
+    if [[ -n ${PS5LM_PARK_TEST_MODEL:-} ]]; then
+        python3 tests/fleet_rpc_park_test.py --build "$out" --model "$PS5LM_PARK_TEST_MODEL" --output build/fleet-park-model
+    fi
     python3 tests/server_system_messages_test.py --build "$out"
     python3 tests/server_checkpoints_test.py --build "$out"
     python3 tests/server_kv_rotation_test.py --build "$out"
