@@ -148,6 +148,49 @@ v0.1.x are the upstream payload releases by cobanov.
   next one although the worker was fine.
 
 ### Changed
+- **More memory for models**: `sce_sys/param.json` declares a 256 MiB flexible pool
+  (the system's default is 448 MiB), so the direct pool, where models go, is
+  12.1875 GiB instead of 12. It applies when the app starts from the home screen,
+  not when it restarts for a model.
+- **A fleet host keeps sampling on the worker with a reasoning budget and with tools**
+  (`patches/0018`, host only): with `--backend-sampling` the worker samples and the
+  scores of the whole vocabulary stay there, 970 KiB a token for Qwen3.8-27B. A
+  reasoning budget or a tool-call grammar switched that off for the request ("backend
+  sampling is not compatible with reasoning budget, disabling"), and every agent
+  request has both: a PS5 wrote 16.3 tokens a second that way against 18.8 without
+  the budget. For such a request the worker now returns the top-k plus one candidate
+  and the host runs its chain, the budget and the grammar on those. The whole
+  vocabulary is fetched only for a token the budget forces, a token the grammar
+  rejects, and two equal scores among the candidates. The tokens are the ones host
+  sampling gives for the same seed. On a CPU worker with Qwen3.5-0.8B a token cost
+  184 bytes from the worker instead of 993,288, and 19,179 of 19,354 tokens of
+  budget-and-tools replies never needed more. It needs a top-k of at most 1024 as the
+  first active sampler (no logit bias or penalties before it), no mirostat, token
+  probabilities or speculative decoding; otherwise, and with
+  `LLAMA_BACKEND_SAMPLING_CHECKS=0`, a request is sampled on the host as before.
+  `LLAMA_BACKEND_SAMPLING_CHECKS=verify` chooses every token both ways and counts
+  the ones that differ, for testing a build on a worker.
+  `tests/server_backend_sampling_test.py` checks it
+  ([FLEET.md](docs/FLEET.md#sampling-on-the-worker)).
+- **A reply sent back is not read again** (`patches/0017`): a chat client sends the
+  previous reply back as a message, and the template and the tokeniser do not always
+  give the tokens the model wrote. The same text can be split into other tokens
+  (` book` `marks` written, ` bookmarks` on the way back), and the whitespace around
+  the end of the reasoning is the template's: what a reasoning budget left before the
+  end-of-reasoning marker, or the model wrote after it, is not what comes back. A hybrid
+  model cannot step back a few tokens, so the slot returned to its checkpoint and read
+  the whole reply again, or the whole last firing after a parked restore, and the
+  parked key was rewritten from there. Qwen3.8-27B serving agents did this on 10 of
+  227 follow-up turns, 84 to 10,508 tokens each. The server now compares the slot's
+  remaining tokens with the prompt as text, and as far as they say the same the prompt
+  continues from the slot's tokens. Whitespace is compared like any text, except right
+  before and right after the marker that closes the thinking block the template opened
+  in an assistant turn. A history that was really changed is read again as
+  before. `prompt_tokens` then counts the kept tokens, a token or two away from a
+  fresh tokenisation. It is off unless `LLAMA_REPLY_AS_GENERATED` is `1` (or `true`, `on`,
+  `yes`); the fleet controller sets it for its hosts, so the app's own server is unchanged.
+  `tests/server_reply_as_generated_test.py` checks it on a host build
+  ([FLEET.md](docs/FLEET.md#a-reply-sent-back)).
 - The fleet's llama-server keeps one context checkpoint and no RAM prompt cache
   (`--ctx-checkpoints 1 --cache-ram 0`): saving either reads caches back from
   every worker over the network.
@@ -214,6 +257,17 @@ v0.1.x are the upstream payload releases by cobanov.
   graphs it used last on each device and tells the worker to free the others.
   Both the host build and the title need the patch; either alone behaves as
   before.
+- **A worker restart waits for the restarted worker**: the control server took the
+  worker port accepting as the restart being over, but the old worker goes on
+  accepting for some seconds after it takes the request. A host started right after
+  `ctl device restart --wait` could then find nothing listening and stop with
+  `Failed to connect`. The port cannot tell the two apart (a worker that has just
+  lost a host also refuses connections for some seconds while it frees what the
+  host held, then accepts again), so the wait is now for PS5LM to have started
+  anew, read from the first line of its `app.log`, and then for the port to accept;
+  the job's result gives both times. A console set to be a worker that reads as
+  idle or busy at that moment is looked at again and restarted as a worker, with
+  the same wait, where before the restart returned at once.
 - **Generation no longer flatlines on a log write**: the GPU driver prints a stats line from its
   submission path, and a write to `app.log` on `/data` could block for 9-26 s with the driver's
   lock held; each blocked print made the next one due, so generation stayed stopped until the app
